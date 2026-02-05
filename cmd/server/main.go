@@ -23,6 +23,7 @@ import (
 	"pai-smart-go/pkg/kafka"
 	"pai-smart-go/pkg/llm"
 	"pai-smart-go/pkg/log"
+	"pai-smart-go/pkg/rerank"
 	"pai-smart-go/pkg/storage"
 	"pai-smart-go/pkg/tika"
 	"pai-smart-go/pkg/token"
@@ -65,12 +66,13 @@ func main() {
 	jwtManager := token.NewJWTManager(cfg.JWT.Secret, cfg.JWT.AccessTokenExpireHours, cfg.JWT.RefreshTokenExpireDays)
 	tikaClient := tika.NewClient(cfg.Tika)
 	embeddingClient := embedding.NewClient(cfg.Embedding)
+	rerankClient := rerank.NewClient(cfg.Rerank) // 初始化 Rerank Client
 	llmClient := llm.NewClient(cfg.LLM)
 	userService := service.NewUserService(userRepository, orgTagRepo, jwtManager)
 	adminService := service.NewAdminService(orgTagRepo, userRepository, conversationRepo)
 	uploadService := service.NewUploadService(uploadRepo, userRepository, cfg.MinIO)
 	documentService := service.NewDocumentService(uploadRepo, userRepository, orgTagRepo, cfg.MinIO, tikaClient)
-	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo)
+	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo, rerankClient) // 注入 Rerank Client
 	conversationService := service.NewConversationService(conversationRepo)
 	chatService := service.NewChatService(searchService, llmClient, conversationRepo)
 

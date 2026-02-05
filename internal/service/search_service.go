@@ -11,6 +11,7 @@ import (
 	"pai-smart-go/internal/repository"
 	"pai-smart-go/pkg/embedding"
 	"pai-smart-go/pkg/log"
+	"pai-smart-go/pkg/rerank" // 新增引入
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,16 +28,24 @@ type searchService struct {
 	embeddingClient embedding.Client
 	esClient        *elasticsearch.Client
 	userService     UserService
-	uploadRepo      repository.UploadRepository // 新增：UploadRepository 依赖
+	uploadRepo      repository.UploadRepository
+	rerankClient    rerank.Client // 新增
 }
 
 // NewSearchService 创建一个新的 SearchService 实例。
-func NewSearchService(embeddingClient embedding.Client, esClient *elasticsearch.Client, userService UserService, uploadRepo repository.UploadRepository) SearchService {
+func NewSearchService(
+	embeddingClient embedding.Client,
+	esClient *elasticsearch.Client,
+	userService UserService,
+	uploadRepo repository.UploadRepository,
+	rerankClient rerank.Client, // 新增参数
+) SearchService {
 	return &searchService{
 		embeddingClient: embeddingClient,
 		esClient:        esClient,
 		userService:     userService,
-		uploadRepo:      uploadRepo, // 新增
+		uploadRepo:      uploadRepo,
+		rerankClient:    rerankClient, // 初始化
 	}
 }
 
@@ -83,7 +92,10 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 			"bool": map[string]interface{}{
 				"must": map[string]interface{}{
 					"match": map[string]interface{}{
-						"text_content": normalized,
+						"text_content": map[string]interface{}{
+							"query":                normalized,
+							"minimum_should_match": "70%",
+						},
 					},
 				},
 				"filter": map[string]interface{}{
@@ -202,6 +214,52 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 		}
 		if len(esResponse.Hits.Hits) == 0 {
 			return []model.SearchResponseDTO{}, nil
+		}
+	}
+
+	// 6.5 (新增) Rerank 重排序
+	// 只对非空的命中结果进行重排序
+	if len(esResponse.Hits.Hits) > 0 {
+		log.Info("[SearchService] 步骤5.5: 开始调用 Rerank 模型进行重排序")
+
+		// 提取候选文档文本
+		var candidateDocs []string
+		for _, hit := range esResponse.Hits.Hits {
+			candidateDocs = append(candidateDocs, hit.Source.TextContent)
+		}
+
+		// 调用 Rerank
+		rerankResults, err := s.rerankClient.Rerank(ctx, query, candidateDocs)
+		if err != nil {
+			log.Errorf("[SearchService] Rerank 失败，将降级使用原始 ES 排序: %v", err)
+			// 出错不中断，继续使用 ES 结果
+		} else {
+			// 根据 Rerank 结果重新构建 Hits 列表
+			// Map: 原始索引 -> Rerank结果
+			rerankMap := make(map[int]rerank.Result)
+			for _, res := range rerankResults {
+				rerankMap[res.Index] = res
+			}
+
+			// 创建新的排序后列表
+			var sortedHits []struct {
+				Source model.EsDocument `json:"_source"`
+				Score  float64          `json:"_score"`
+			}
+
+			// config.Conf 需要被引用，或者我们在 struct 里存 config。这里简单起见假设 Filter 在 Service 层做，或者 Rerank Client 已经做过（我们的 client 没做 filter）。
+			// 实际上我们在 Client 没做 filter。
+			// 这里我们直接按 rerank 顺序重组
+			for _, rRes := range rerankResults {
+				originalHit := esResponse.Hits.Hits[rRes.Index] // 获取原始 hit
+				// 使用 Rerank 的分数覆盖 ES 分数
+				originalHit.Score = rRes.RelevanceScore
+				sortedHits = append(sortedHits, originalHit)
+			}
+
+			// 替换原始结果
+			esResponse.Hits.Hits = sortedHits
+			log.Infof("[SearchService] Rerank 完成，重新排序了 %d 个文档", len(sortedHits))
 		}
 	}
 

@@ -23,6 +23,7 @@ type Config struct {
 	Embedding     EmbeddingConfig     `mapstructure:"embedding"`
 	LLM           LLMConfig           `mapstructure:"llm"`
 	AI            AIConfig            `mapstructure:"ai"`
+	Rerank        RerankConfig        `mapstructure:"rerank"`
 }
 
 // ServerConfig 存储服务器相关的配置。
@@ -97,6 +98,15 @@ type EmbeddingConfig struct {
 	BaseURL    string `mapstructure:"base_url"`
 	Model      string `mapstructure:"model"`
 	Dimensions int    `mapstructure:"dimensions"`
+}
+
+// RerankConfig 存储 Rerank 模型相关的配置。
+type RerankConfig struct {
+	Enable   bool    `mapstructure:"enable"`
+	APIKey   string  `mapstructure:"api_key"`
+	BaseURL  string  `mapstructure:"base_url"`
+	Model    string  `mapstructure:"model"`
+	MinScore float64 `mapstructure:"min_score"`
 }
 
 // LLMConfig 存储大语言模型相关的配置。
