@@ -3,10 +3,11 @@ package repository
 
 import (
 	"context"
-	"github.com/go-redis/redis/v8"
-	"gorm.io/gorm"
 	"pai-smart-go/internal/model"
 	"strconv"
+
+	"github.com/go-redis/redis/v8"
+	"gorm.io/gorm"
 )
 
 // UploadRepository 接口定义了文件上传相关的数据持久化操作。
@@ -20,6 +21,7 @@ type UploadRepository interface {
 	DeleteFileUploadRecord(fileMD5 string, userID uint) error
 	UpdateFileUploadRecord(record *model.FileUpload) error
 	FindBatchByMD5s(md5s []string) ([]*model.FileUpload, error)
+	FindAllWithPagination(page int, pageSize int) ([]model.FileUpload, int64, error)
 
 	// ChunkInfo operations (GORM)
 	CreateChunkInfoRecord(record *model.ChunkInfo) error
@@ -161,6 +163,27 @@ func (r *uploadRepository) GetUploadedChunksFromRedis(ctx context.Context, fileM
 		}
 	}
 	return uploaded, nil
+}
+
+// FindAllWithPagination retrieves file upload records with pagination support.
+func (r *uploadRepository) FindAllWithPagination(page int, pageSize int) ([]model.FileUpload, int64, error) {
+	var files []model.FileUpload
+	var total int64
+
+	// Count total records
+	if err := r.db.Model(&model.FileUpload{}).Where("status = ?", 1).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	// Get paginated records
+	offset := (page - 1) * pageSize
+	err := r.db.Where("status = ?", 1).
+		Order("created_at DESC").
+		Limit(pageSize).
+		Offset(offset).
+		Find(&files).Error
+
+	return files, total, err
 }
 
 // DeleteUploadMark deletes the upload status key from Redis.

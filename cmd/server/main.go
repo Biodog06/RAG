@@ -72,9 +72,10 @@ func main() {
 	adminService := service.NewAdminService(orgTagRepo, userRepository, conversationRepo)
 	uploadService := service.NewUploadService(uploadRepo, userRepository, cfg.MinIO)
 	documentService := service.NewDocumentService(uploadRepo, userRepository, orgTagRepo, cfg.MinIO, tikaClient)
+	cacheService := service.NewContentCacheService()                                                               // Initialize CacheService
 	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo, rerankClient) // 注入 Rerank Client
 	conversationService := service.NewConversationService(conversationRepo)
-	chatService := service.NewChatService(searchService, llmClient, conversationRepo)
+	chatService := service.NewChatService(searchService, llmClient, conversationRepo, cacheService)
 
 	// 6. 初始化文件处理管道 (Processor)
 	processor := pipeline.NewProcessor(

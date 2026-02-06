@@ -25,6 +25,8 @@ type MessageWriter interface {
 type Client interface {
 	// StreamChatMessages 以 role-based 消息与可选生成参数调用聊天接口，并将流式分块写入 writer。
 	StreamChatMessages(ctx context.Context, messages []Message, gen *GenerationParams, writer MessageWriter) error
+	// GenerateOneShot 执行非流式调用，直接返回完整生成的文本。
+	GenerateOneShot(ctx context.Context, messages []Message) (string, error)
 	// 为兼容旧调用，保留 StreamChat：由内部包装为 messages 调用。
 	StreamChat(ctx context.Context, prompt string, writer MessageWriter) error
 }
@@ -65,11 +67,63 @@ type chatResponse struct {
 	} `json:"choices"`
 }
 
+type oneShotResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
+}
+
 // GenerationParams 控制生成行为
 type GenerationParams struct {
 	Temperature *float64
 	TopP        *float64
 	MaxTokens   *int
+}
+
+// GenerateOneShot calls the API for a non-streaming completion.
+func (c *deepseekClient) GenerateOneShot(ctx context.Context, messages []Message) (string, error) {
+	reqBody := chatRequest{
+		Model:    c.cfg.Model,
+		Messages: messages,
+		Stream:   false,
+	}
+
+	reqBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal chat request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.cfg.BaseURL+"/chat/completions", bytes.NewReader(reqBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create chat request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to call chat api: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("chat api returned non-200 status: %s, body: %s", resp.Status, string(bodyBytes))
+	}
+
+	var parsedResp oneShotResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsedResp); err != nil {
+		return "", fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if len(parsedResp.Choices) == 0 {
+		return "", fmt.Errorf("empty choices in response")
+	}
+
+	return parsedResp.Choices[0].Message.Content, nil
 }
 
 // StreamChat calls the DeepSeek API for chat completions and streams the response.

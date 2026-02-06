@@ -73,7 +73,12 @@ func createIndexIfNotExists(indexName string) error {
 					"type": "dense_vector",
 					"dims": 2048,
 					"index": true,
-					"similarity": "cosine"
+					"similarity": "cosine",
+					"index_options": {
+						"type": "int8_hnsw",
+						"m": 24,
+						"ef_construction": 128
+					}
 				},
 				"model_version": { "type": "keyword" },
 				"user_id": { "type": "long" },

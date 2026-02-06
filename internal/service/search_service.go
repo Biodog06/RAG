@@ -87,6 +87,16 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 			"query_vector":   queryVector,
 			"k":              topK * 30,
 			"num_candidates": topK * 30,
+			"filter": map[string]interface{}{
+				"bool": map[string]interface{}{
+					"should": []map[string]interface{}{
+						{"term": map[string]interface{}{"user_id": user.ID}},
+						{"term": map[string]interface{}{"is_public": true}},
+						{"terms": map[string]interface{}{"org_tag": userEffectiveTags}},
+					},
+					"minimum_should_match": 1,
+				},
+			},
 		},
 		"query": map[string]interface{}{
 			"bool": map[string]interface{}{

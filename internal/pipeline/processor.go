@@ -12,9 +12,10 @@ import (
 	"pai-smart-go/pkg/embedding"
 	"pai-smart-go/pkg/es"
 	"pai-smart-go/pkg/log"
+	"pai-smart-go/pkg/splitter"
 	"pai-smart-go/pkg/storage"
 	"pai-smart-go/pkg/tasks"
-	"pai-smart-go/pkg/tika"
+	"pai-smart-go/pkg/tika" // Added splitter package
 	"unicode/utf8"
 
 	"github.com/minio/minio-go/v7"
@@ -94,7 +95,17 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 
 	// 3. 文本切块
 	log.Info("[Processor] 步骤3: 进行文本分块, chunkSize: 1000, chunkOverlap: 100")
-	chunks := p.splitText(textContent, 1000, 100)
+
+	var chunks []string
+	if isMarkdown(task.FileName) {
+		log.Infof("[Processor] 检测到 Markdown 文件，使用智能分块策略: %s", task.FileName)
+		mdSplitter := splitter.NewMarkdownSplitter()
+		chunks = mdSplitter.Split(textContent, 1000, 100)
+	} else {
+		txtSplitter := splitter.NewSimpleTextSplitter()
+		chunks = txtSplitter.Split(textContent, 1000, 100)
+	}
+
 	log.Infof("[Processor] 步骤3: 文本分块完成, 共生成 %d 个分块", len(chunks))
 	if len(chunks) == 0 {
 		log.Warnf("[Processor] 未生成任何文本分块, 处理中止, FileName: %s", task.FileName)
@@ -171,46 +182,11 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 	return nil
 }
 
-// splitText 将长文本按指定大小和重叠进行切分。
-// (与Java的CharacterTextSplitter逻辑保持一致)
-func (p *Processor) splitText(text string, chunkSize int, chunkOverlap int) []string {
-	if chunkSize <= chunkOverlap {
-		// Fallback to simple split if overlap is invalid
-		return p.simpleSplit(text, chunkSize)
+// isMarkdown checks if the file is a markdown file.
+func isMarkdown(fileName string) bool {
+	ext := ""
+	if len(fileName) > 3 {
+		ext = fileName[len(fileName)-3:]
 	}
-
-	var chunks []string
-	runes := []rune(text)
-	if len(runes) == 0 {
-		return nil
-	}
-
-	step := chunkSize - chunkOverlap
-	for i := 0; i < len(runes); i += step {
-		end := i + chunkSize
-		if end > len(runes) {
-			end = len(runes)
-		}
-		chunks = append(chunks, string(runes[i:end]))
-		if end == len(runes) {
-			break
-		}
-	}
-	return chunks
-}
-
-func (p *Processor) simpleSplit(text string, chunkSize int) []string {
-	var chunks []string
-	runes := []rune(text)
-	if len(runes) == 0 {
-		return nil
-	}
-	for i := 0; i < len(runes); i += chunkSize {
-		end := i + chunkSize
-		if end > len(runes) {
-			end = len(runes)
-		}
-		chunks = append(chunks, string(runes[i:end]))
-	}
-	return chunks
+	return ext == ".md" || ext == ".MD"
 }

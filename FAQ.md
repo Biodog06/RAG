@@ -90,3 +90,41 @@
     -   Rerank 速度太慢，无法处理百万级文档，必须依赖 BM25+Vector 进行**快速初筛 (First-stage Retrieval)**。
     -   BM25 擅长精确关键词匹配（如错误码、专有名词），是向量检索的重要互补（向量容易漂移）。
     -   二者是**前鋒（召回）**与**守门员（精排）**的关系，缺一不可。
+
+---
+
+## 10. 什么是 MCP (Model Context Protocol)？有什么用？
+
+- **解答**:
+    - **定义**: MCP 是一个开放标准协议，像 USB 接口一样连接 **AI 模型** (Claude) 和 **数据/工具** (你的知识库)。
+    - **区别**: 
+        - **普通 RAG**: 你必须在**你的网页**里用 AI。
+        - **MCP RAG**: 你可以在 **Cursor IDE**、**VS Code** 或 **Claude Desktop** 里直接调用你的知识库。
+    - **核心价值**: 让知识库**“被集成”**到用户的工作流中，而不是让用户跳出来找你。它让你的系统从一个“Web 网站”变成了一个“操作系统级服务”。
+
+---
+
+## 11. MCP 代码中 `AddTool` 的 `map` 参数是怎么传进来的？
+
+- **问题背景**: `AddTool` 回调函数中 `request.Params.Arguments` 是个 `map`，谁解析的？
+- **解答**:
+    - **客户端**: 发送的是标准 JSON 文本 `{"method": "tools/call", "params": {"arguments": {"query": "..."}}}`。
+    - **Go SDK (mcp-go)**: SDK 内部负责监听 stido/http，接收到 JSON 后使用 `json.Unmarshal` 将其**反序列化**。
+    - **Go 语言特性**: 在 Go 中，JSON Object 默认会被反序列化为 `map[string]interface{}` (如果你用 `any` 接收)。
+    - **我们**: 所以在 Handler 里，你需要用 `.(map[string]interface{})` 进行**类型断言**才能把它当 map 用。
+
+---
+
+## 12. 我的 MCP Client 在哪里？
+
+- **解答**:
+    - **你不需要自己写代码实现 Client**。
+    - 在 MCP 架构中，Client 通常是那些**支持该协议的 AI 应用程序**，例如：
+        -   **Claude Desktop** (官方桌面端)
+        -   **Cursor** (代码编辑器)
+        -   **VS Code** (配合 AI 插件)
+    - 我们的工作是开发 **Server (`cmd/mcp-server`)**，也就是“提供工具的一方”。
+    - 只要你把 Server 跑起来，并在上述 App 的配置文件里填上 Server 的路径，**这些 App 就会自动充当 Client** 来连接你的服务。
+
+
+---
