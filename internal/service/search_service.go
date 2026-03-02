@@ -7,16 +7,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"pai-smart-go/internal/config"
 	"pai-smart-go/internal/model"
 	"pai-smart-go/internal/repository"
 	"pai-smart-go/pkg/embedding"
+	"pai-smart-go/pkg/llm" // 新增引入
 	"pai-smart-go/pkg/log"
 	"pai-smart-go/pkg/rerank" // 新增引入
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/elastic/go-elasticsearch/v8"
+	"github.com/go-redis/redis/v8"
 )
 
 // SearchService 接口定义了搜索操作。
@@ -29,7 +34,10 @@ type searchService struct {
 	esClient        *elasticsearch.Client
 	userService     UserService
 	uploadRepo      repository.UploadRepository
-	rerankClient    rerank.Client // 新增
+	rerankClient    rerank.Client   // 新增
+	llmClient       llm.Client      // 新增：用于关键词提取
+	segmenter       *QuerySegmenter // 新增：分词器
+	redisClient     *redis.Client   // 新增：缓存客户端
 }
 
 // NewSearchService 创建一个新的 SearchService 实例。
@@ -39,13 +47,25 @@ func NewSearchService(
 	userService UserService,
 	uploadRepo repository.UploadRepository,
 	rerankClient rerank.Client, // 新增参数
+	llmClient llm.Client, // 新增参数
+	segmenterConfig config.SegmenterConfig, // 新增参数
+	redisClient *redis.Client, // 新增参数：缓存客户端
 ) SearchService {
+	// 初始化分词器
+	segmenter := GetSegmenter(SegmenterConfig{
+		Enabled: segmenterConfig.Enabled,
+		Dict:    segmenterConfig.Dict,
+	})
+
 	return &searchService{
 		embeddingClient: embeddingClient,
 		esClient:        esClient,
 		userService:     userService,
 		uploadRepo:      uploadRepo,
 		rerankClient:    rerankClient, // 初始化
+		llmClient:       llmClient,    // 初始化
+		segmenter:       segmenter,    // 初始化
+		redisClient:     redisClient,  // 初始化
 	}
 }
 
@@ -63,223 +83,259 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 	}
 	log.Infof("[SearchService] 获取到 %d 个有效组织标签: %v", len(userEffectiveTags), userEffectiveTags)
 
-	// 2. 轻量归一化（去噪）以获取核心短语
-	normalized, phrase := normalizeQuery(query)
-	if normalized != query {
-		log.Infof("[SearchService] 规范化查询: '%s' -> '%s' (phrase='%s')", query, normalized, phrase)
+	// 2. 使用 LLM 提取关键词（核心词 + 可选词）
+	log.Info("[SearchService] 步骤2: 开始提取查询关键词")
+	keywords, err := s.extractKeywords(ctx, query)
+	if err != nil {
+		log.Warnf("[SearchService] 关键词提取失败，使用原始查询: %v", err)
+		// 降级：使用原始归一化逻辑
+		normalized, phrase := normalizeQuery(query)
+		keywords = &KeywordExtractionResult{
+			CoreKeywords:     []string{normalized},
+			OptionalKeywords: []string{},
+		}
+		if phrase != "" && phrase != normalized {
+			keywords.OptionalKeywords = []string{phrase}
+		}
+	}
+	log.Infof("[SearchService] 关键词提取完成 - 核心词: %v, 可选词: %v",
+		keywords.CoreKeywords, keywords.OptionalKeywords)
+
+	// 2.5. 检查关键词缓存 (Result Cache)
+	if s.redisClient != nil {
+		cacheKey := generateCacheKey(keywords)
+		if cacheKey != "" {
+			log.Infof("[SearchService] 尝试查询缓存, key: %s", cacheKey)
+			cachedDocIDs, err := s.redisClient.Get(ctx, cacheKey).Result()
+			if err == nil && cachedDocIDs != "" {
+				// 缓存命中！解析 DocIDs 并批量查询
+				log.Infof("[SearchService] 缓存命中! 跳过 ES 检索与 Rerank")
+				docIDs := strings.Split(cachedDocIDs, ",")
+				if results, err := s.batchGetDocsByIDs(ctx, docIDs, user, userEffectiveTags); err == nil {
+					log.Infof("[SearchService] 从缓存快速路径返回 %d 条结果", len(results))
+					return results, nil
+				} else {
+					log.Warnf("[SearchService] 批量查询文档失败，降级到完整检索: %v", err)
+				}
+			}
+		}
 	}
 
 	// 3. 向量化查询（用原始用户问句，保持语义检索能力）
-	log.Info("[SearchService] 步骤2: 开始向量化查询")
+	log.Info("[SearchService] 步骤3: 开始向量化查询")
 	queryVector, err := s.embeddingClient.CreateEmbedding(ctx, query)
 	if err != nil {
 		log.Errorf("[SearchService] 向量化查询失败: %v", err)
 		return nil, fmt.Errorf("failed to create query embedding: %w", err)
 	}
-	log.Infof("[SearchService] 步骤2: 向量化查询成功, 向量维度: %d", len(queryVector))
+	log.Infof("[SearchService] 步骤3: 向量化查询成功, 向量维度: %d", len(queryVector))
 
-	// 4. 构建 Elasticsearch 的复杂混合搜索查询 (与Java对齐)，并加入短语兜底 should
-	log.Info("[SearchService] 步骤3: 开始构建 Elasticsearch 两阶段混合搜索查询")
-	var buf bytes.Buffer
-	esQuery := map[string]interface{}{
-		"knn": map[string]interface{}{
-			"field":          "vector",
-			"query_vector":   queryVector,
-			"k":              topK * 30,
-			"num_candidates": topK * 30,
-			"filter": map[string]interface{}{
-				"bool": map[string]interface{}{
-					"should": []map[string]interface{}{
-						{"term": map[string]interface{}{"user_id": user.ID}},
-						{"term": map[string]interface{}{"is_public": true}},
-						{"terms": map[string]interface{}{"org_tag": userEffectiveTags}},
-					},
-					"minimum_should_match": 1,
-				},
-			},
-		},
-		"query": map[string]interface{}{
-			"bool": map[string]interface{}{
-				"must": map[string]interface{}{
-					"match": map[string]interface{}{
-						"text_content": map[string]interface{}{
-							"query":                normalized,
-							"minimum_should_match": "70%",
-						},
-					},
-				},
-				"filter": map[string]interface{}{
-					"bool": map[string]interface{}{
-						"should": []map[string]interface{}{
-							{"term": map[string]interface{}{"user_id": user.ID}},
-							{"term": map[string]interface{}{"is_public": true}},
-							{"terms": map[string]interface{}{"org_tag": userEffectiveTags}},
-						},
-						"minimum_should_match": 1,
-					},
-				},
-				// 额外的 should：对核心短语做 match_phrase 以兜底召回
-				"should": buildPhraseShould(phrase),
-			},
-		},
-		"rescore": map[string]interface{}{
-			"window_size": topK * 30, // 与 Java 的 recallK 对齐
-			"query": map[string]interface{}{
-				"rescore_query": map[string]interface{}{
-					"match": map[string]interface{}{
-						"text_content": map[string]interface{}{
-							"query":    normalized,
-							"operator": "and",
-						},
-					},
-				},
-				"query_weight":         0.2, // 保留部分 k-NN 分数
-				"rescore_query_weight": 1.0, // BM25 分数权重
-			},
-		},
-		"size": topK,
-	}
+	// 4. 并行执行多路召回 (Vector Search + Keyword Search)
+	log.Info("[SearchService] 步骤4: 并行执行多路召回 (Vector + Keyword)")
 
-	if err := json.NewEncoder(&buf).Encode(esQuery); err != nil {
-		log.Errorf("[SearchService] 序列化 Elasticsearch 查询失败: %v", err)
-		return nil, fmt.Errorf("failed to encode es query: %w", err)
-	}
-	log.Infof("[SearchService] 构建的 Elasticsearch 查询语句: %s", buf.String())
-
-	// 5. 执行搜索
-	log.Info("[SearchService] 步骤4: 开始向 Elasticsearch 发送搜索请求")
-	// 与 Java 索引名保持一致（假设为 knowledge_base）
-	res, err := s.esClient.Search(
-		s.esClient.Search.WithContext(ctx),
-		s.esClient.Search.WithIndex("knowledge_base"),
-		s.esClient.Search.WithBody(&buf),
-		s.esClient.Search.WithTrackTotalHits(true),
+	const (
+		rrfK       = 60.0
+		recallSize = 60 // 每路召回数量
 	)
-	if err != nil {
-		log.Errorf("[SearchService] 向 Elasticsearch 发送搜索请求失败: %v", err)
-		return nil, fmt.Errorf("elasticsearch search failed: %w", err)
-	}
-	defer res.Body.Close()
 
-	if res.IsError() {
-		bodyBytes, _ := io.ReadAll(res.Body)
-		log.Errorf("[SearchService] Elasticsearch 返回错误, status: %s, body: %s", res.Status(), string(bodyBytes))
-		return nil, fmt.Errorf("elasticsearch returned an error: %s", res.String())
+	// 构造过滤器 (两路通用)
+	filterConditions := []map[string]interface{}{
+		{"term": map[string]interface{}{"user_id": user.ID}},
+		{"term": map[string]interface{}{"is_public": true}},
+		{"terms": map[string]interface{}{"org_tag": userEffectiveTags}},
 	}
-	log.Info("[SearchService] 成功从 Elasticsearch 获取响应")
-
-	// 6. 解析结果
-	log.Info("[SearchService] 步骤5: 开始解析 Elasticsearch 响应")
-	var esResponse struct {
-		Hits struct {
-			Hits []struct {
-				Source model.EsDocument `json:"_source"`
-				Score  float64          `json:"_score"` // 获取 ES 的 score
-			} `json:"hits"`
-		} `json:"hits"`
+	boolFilter := map[string]interface{}{
+		"bool": map[string]interface{}{
+			"should":               filterConditions,
+			"minimum_should_match": 1,
+		},
 	}
 
-	if err := json.NewDecoder(res.Body).Decode(&esResponse); err != nil {
-		log.Errorf("[SearchService] 解析 Elasticsearch 响应失败: %v", err)
-		return nil, fmt.Errorf("failed to decode es response: %w", err)
-	}
+	var wg sync.WaitGroup
+	var denseDocs, sparseDocs []model.EsDocument
+	var denseErr, sparseErr error
 
-	if len(esResponse.Hits.Hits) == 0 {
-		log.Infof("[SearchService] Elasticsearch 返回 0 条命中结果")
-		// 兜底：若规范化后核心短语存在且与原问句不同，则用核心短语重试一次（更强关键词信号）
-		if phrase != "" && phrase != query {
-			log.Infof("[SearchService] 使用核心短语重试查询: '%s'", phrase)
-			// rebuild with phrase in must+rescore
-			var retryBuf bytes.Buffer
-			retryQuery := esQuery
-			// update must.match.text_content
-			((retryQuery["query"].(map[string]interface{}))["bool"].(map[string]interface{}))["must"] = map[string]interface{}{
+	// 4.1 向量检索 (Dense Retrieval)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Infof("[SearchService] 开始向量检索 (Dense Retrieval)")
+		queryBody := map[string]interface{}{
+			"knn": map[string]interface{}{
+				"field":          "vector",
+				"query_vector":   queryVector,
+				"k":              recallSize,
+				"num_candidates": 100,
+				"filter":         boolFilter,
+			},
+			"_source": []string{"file_md5", "chunk_id", "text_content", "user_id", "org_tag", "is_public", "vector_id"},
+			"size":    recallSize,
+		}
+		denseDocs, denseErr = s.executeEsQuery(ctx, queryBody)
+		if denseErr != nil {
+			log.Errorf("[SearchService] 向量检索失败: %v", denseErr)
+		} else {
+			log.Infof("[SearchService] 向量检索召回 %d 条文档", len(denseDocs))
+		}
+	}()
+
+	// 4.2 关键词检索 (Sparse Retrieval)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Infof("[SearchService] 开始关键词检索 (Sparse Retrieval)")
+
+		// 构建 bool query
+		boolQuery := map[string]interface{}{
+			"filter": boolFilter,
+		}
+
+		// 构建 must/should 子句
+		var mustClauses []map[string]interface{}
+		for _, kw := range keywords.CoreKeywords {
+			mustClauses = append(mustClauses, map[string]interface{}{
 				"match": map[string]interface{}{
-					"text_content": phrase,
+					"text_content": kw,
 				},
-			}
-			// update rescore query
-			((retryQuery["rescore"].(map[string]interface{}))["query"].(map[string]interface{}))["rescore_query"] = map[string]interface{}{
+			})
+		}
+		var shouldClauses []map[string]interface{}
+		for _, kw := range keywords.OptionalKeywords {
+			shouldClauses = append(shouldClauses, map[string]interface{}{
+				"match": map[string]interface{}{
+					"text_content": kw,
+				},
+			})
+		}
+
+		// 如果没有任何关键词，使用 normalized query 作为兜底
+		if len(keywords.CoreKeywords) == 0 && len(keywords.OptionalKeywords) == 0 {
+			normalized, _ := normalizeQuery(query)
+			mustClauses = append(mustClauses, map[string]interface{}{
 				"match": map[string]interface{}{
 					"text_content": map[string]interface{}{
-						"query":    phrase,
-						"operator": "and",
+						"query":                normalized,
+						"minimum_should_match": "70%",
 					},
 				},
-			}
-			if err := json.NewEncoder(&retryBuf).Encode(retryQuery); err == nil {
-				res2, err2 := s.esClient.Search(
-					s.esClient.Search.WithContext(ctx),
-					s.esClient.Search.WithIndex("knowledge_base"),
-					s.esClient.Search.WithBody(&retryBuf),
-					s.esClient.Search.WithTrackTotalHits(true),
-				)
-				if err2 == nil && !res2.IsError() {
-					defer res2.Body.Close()
-					if err := json.NewDecoder(res2.Body).Decode(&esResponse); err == nil {
-						log.Infof("[SearchService] 重试后命中 %d 条", len(esResponse.Hits.Hits))
-					}
-				}
-			}
-		}
-		if len(esResponse.Hits.Hits) == 0 {
-			return []model.SearchResponseDTO{}, nil
-		}
-	}
-
-	// 6.5 (新增) Rerank 重排序
-	// 只对非空的命中结果进行重排序
-	if len(esResponse.Hits.Hits) > 0 {
-		log.Info("[SearchService] 步骤5.5: 开始调用 Rerank 模型进行重排序")
-
-		// 提取候选文档文本
-		var candidateDocs []string
-		for _, hit := range esResponse.Hits.Hits {
-			candidateDocs = append(candidateDocs, hit.Source.TextContent)
+			})
 		}
 
-		// 调用 Rerank
-		rerankResults, err := s.rerankClient.Rerank(ctx, query, candidateDocs)
-		if err != nil {
-			log.Errorf("[SearchService] Rerank 失败，将降级使用原始 ES 排序: %v", err)
-			// 出错不中断，继续使用 ES 结果
+		if len(mustClauses) > 0 {
+			boolQuery["must"] = mustClauses
+		}
+		if len(shouldClauses) > 0 {
+			boolQuery["should"] = shouldClauses
+		}
+
+		queryBody := map[string]interface{}{
+			"query": map[string]interface{}{
+				"bool": boolQuery,
+			},
+			"_source": []string{"file_md5", "chunk_id", "text_content", "user_id", "org_tag", "is_public", "vector_id"},
+			"size":    recallSize,
+		}
+		sparseDocs, sparseErr = s.executeEsQuery(ctx, queryBody)
+		if sparseErr != nil {
+			log.Errorf("[SearchService] 关键词检索失败: %v", sparseErr)
 		} else {
-			// 根据 Rerank 结果重新构建 Hits 列表
-			// Map: 原始索引 -> Rerank结果
-			rerankMap := make(map[int]rerank.Result)
-			for _, res := range rerankResults {
-				rerankMap[res.Index] = res
-			}
-
-			// 创建新的排序后列表
-			var sortedHits []struct {
-				Source model.EsDocument `json:"_source"`
-				Score  float64          `json:"_score"`
-			}
-
-			// config.Conf 需要被引用，或者我们在 struct 里存 config。这里简单起见假设 Filter 在 Service 层做，或者 Rerank Client 已经做过（我们的 client 没做 filter）。
-			// 实际上我们在 Client 没做 filter。
-			// 这里我们直接按 rerank 顺序重组
-			for _, rRes := range rerankResults {
-				originalHit := esResponse.Hits.Hits[rRes.Index] // 获取原始 hit
-				// 使用 Rerank 的分数覆盖 ES 分数
-				originalHit.Score = rRes.RelevanceScore
-				sortedHits = append(sortedHits, originalHit)
-			}
-
-			// 替换原始结果
-			esResponse.Hits.Hits = sortedHits
-			log.Infof("[SearchService] Rerank 完成，重新排序了 %d 个文档", len(sortedHits))
+			log.Infof("[SearchService] 关键词检索召回 %d 条文档", len(sparseDocs))
 		}
+	}()
+
+	wg.Wait()
+
+	// 5. RRF 融合 (Reciprocal Rank Fusion)
+	log.Info("[SearchService] 步骤5: 执行 RRF 融合")
+	var resultLists [][]interface{}
+
+	if len(denseDocs) > 0 {
+		list := make([]interface{}, len(denseDocs))
+		for i, v := range denseDocs {
+			list[i] = v
+		}
+		resultLists = append(resultLists, list)
+	}
+	if len(sparseDocs) > 0 {
+		list := make([]interface{}, len(sparseDocs))
+		for i, v := range sparseDocs {
+			list[i] = v
+		}
+		resultLists = append(resultLists, list)
 	}
 
-	// 7. 批量获取文件名
-	log.Info("[SearchService] 步骤6: 开始批量获取文件名")
-	fileMD5s := make([]string, 0, len(esResponse.Hits.Hits))
-	for _, hit := range esResponse.Hits.Hits {
-		fileMD5s = append(fileMD5s, hit.Source.FileMD5)
+	if len(resultLists) == 0 {
+		log.Warnf("[SearchService] 所有召回路径均无结果")
+		return []model.SearchResponseDTO{}, nil
 	}
-	// 使用 map 去重
+
+	fusionResults := ReciprocalRankFusion(resultLists, func(doc interface{}) string {
+		return doc.(model.EsDocument).VectorID
+	}, rrfK)
+
+	log.Infof("[SearchService] RRF 融合完成，共 %d 个唯一文档", len(fusionResults))
+
+	// 6. Rerank 重排序
+	log.Info("[SearchService] 步骤6: Rerank 重排序")
+
+	// 取 Top 50 给 Rerank
+	rerankSize := 50
+	if len(fusionResults) > rerankSize {
+		fusionResults = fusionResults[:rerankSize]
+	}
+
+	// 准备 Rerank 数据
+	type ScoredDoc struct {
+		Doc   model.EsDocument
+		Score float64
+	}
+	var rerankCandidates []ScoredDoc
+	var candidateTexts []string
+
+	for _, res := range fusionResults {
+		doc := res.Doc.(model.EsDocument)
+		rerankCandidates = append(rerankCandidates, ScoredDoc{doc, res.Score})
+		candidateTexts = append(candidateTexts, doc.TextContent)
+	}
+
+	// 执行 Rerank
+	var finalDocs []ScoredDoc
+
+	// 如果候选集为空，直接返回空
+	if len(candidateTexts) == 0 {
+		return []model.SearchResponseDTO{}, nil
+	}
+
+	rerankResults, err := s.rerankClient.Rerank(ctx, query, candidateTexts)
+	if err != nil {
+		log.Warnf("[SearchService] Rerank 失败，使用 RRF 原序: %v", err)
+		finalDocs = rerankCandidates
+	} else {
+		// 根据 Rerank 结果重新排序
+		// 注意：rerankResults 的 Index 对应 candidateTexts 的索引
+		for _, res := range rerankResults {
+			if res.Index < len(rerankCandidates) {
+				original := rerankCandidates[res.Index]
+				// 使用 Rerank 分数覆盖 RRF 分数
+				finalDocs = append(finalDocs, ScoredDoc{original.Doc, res.RelevanceScore})
+			}
+		}
+		log.Infof("[SearchService] Rerank 完成，重新排序了 %d 个文档", len(finalDocs))
+	}
+
+	// 7. 截取 Top K 并组装结果
+	log.Info("[SearchService] 步骤7: 获取文件名并组装最终结果")
+
+	if len(finalDocs) > topK {
+		finalDocs = finalDocs[:topK]
+	}
+
+	// 批量查询文件名
+	fileMD5s := make([]string, 0, len(finalDocs))
+	for _, doc := range finalDocs {
+		fileMD5s = append(fileMD5s, doc.Doc.FileMD5)
+	}
+	// 去重
 	uniqueMD5s := make(map[string]struct{})
 	for _, md5 := range fileMD5s {
 		uniqueMD5s[md5] = struct{}{}
@@ -290,41 +346,59 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 	}
 
 	fileInfos, err := s.uploadRepo.FindBatchByMD5s(md5List)
+	fileNameMap := make(map[string]string)
 	if err != nil {
 		log.Errorf("[SearchService] 批量查询文件信息失败: %v", err)
-		return nil, fmt.Errorf("批量查询文件信息失败: %w", err)
+	} else {
+		for _, info := range fileInfos {
+			fileNameMap[info.FileMD5] = info.FileName
+		}
 	}
 
-	fileNameMap := make(map[string]string)
-	for _, info := range fileInfos {
-		fileNameMap[info.FileMD5] = info.FileName
-	}
-	log.Infof("[SearchService] 批量获取文件名成功, 共获取 %d 个文件信息", len(fileNameMap))
-
-	// 8. 组装最终结果
-	log.Info("[SearchService] 步骤7: 开始组装最终响应 DTO")
 	var results []model.SearchResponseDTO
-	for _, hit := range esResponse.Hits.Hits {
-		fileName := fileNameMap[hit.Source.FileMD5]
+	for _, doc := range finalDocs {
+		fileName := fileNameMap[doc.Doc.FileMD5]
 		if fileName == "" {
-			log.Warnf("[SearchService] 未找到 FileMD5 '%s' 对应的文件名, 将使用 '未知文件'", hit.Source.FileMD5)
 			fileName = "未知文件"
 		}
 		dto := model.SearchResponseDTO{
-			FileMD5:     hit.Source.FileMD5,
+			FileMD5:     doc.Doc.FileMD5,
 			FileName:    fileName,
-			ChunkID:     hit.Source.ChunkID,
-			TextContent: hit.Source.TextContent,
-			Score:       hit.Score,
-			UserID:      strconv.FormatUint(uint64(hit.Source.UserID), 10),
-			OrgTag:      hit.Source.OrgTag,
-			IsPublic:    hit.Source.IsPublic,
+			ChunkID:     doc.Doc.ChunkID,
+			TextContent: doc.Doc.TextContent,
+			Score:       doc.Score,
+			UserID:      strconv.FormatUint(uint64(doc.Doc.UserID), 10),
+			OrgTag:      doc.Doc.OrgTag,
+			IsPublic:    doc.Doc.IsPublic,
 		}
 		results = append(results, dto)
 	}
 
-	log.Infof("[SearchService] 组装最终响应成功, 返回 %d 条结果", len(results))
-	log.Infof("[SearchService] 混合搜索执行完毕, query: '%s'", query)
+	// 8. 异步写入缓存 (仅在未命中时)
+	if s.redisClient != nil {
+		cacheKey := generateCacheKey(keywords)
+		if cacheKey != "" && len(finalDocs) > 0 {
+			// 提取 VectorIDs
+			var docIDs []string
+			for _, doc := range finalDocs {
+				docIDs = append(docIDs, doc.Doc.VectorID)
+			}
+			cachedValue := strings.Join(docIDs, ",")
+
+			// 异步写入
+			go func(key, value string) {
+				// 使用 Background context 避免父 context 取消
+				cacheCtx := context.Background()
+				if err := s.redisClient.Set(cacheCtx, key, value, 24*3600*1000000000).Err(); err != nil { // 24小时 (纳秒)
+					log.Warnf("[SearchService] 缓存写入失败: %v", err)
+				} else {
+					log.Infof("[SearchService] 成功写入缓存, key: %s, docCount: %d", key, len(docIDs))
+				}
+			}(cacheKey, cachedValue)
+		}
+	}
+
+	log.Infof("[SearchService] 混合搜索执行完毕, query: '%s', 返回 %d 条结果", query, len(results))
 	return results, nil
 }
 
@@ -352,19 +426,273 @@ func normalizeQuery(q string) (string, string) {
 	return kept, kept
 }
 
-// buildPhraseShould 构建 match_phrase should 子句（带 boost），为空则返回 nil
-func buildPhraseShould(phrase string) interface{} {
-	if phrase == "" {
-		return nil
+// KeywordExtractionResult 关键词提取结果
+type KeywordExtractionResult struct {
+	CoreKeywords     []string // 核心关键词（必须匹配）
+	OptionalKeywords []string // 可选关键词（提升相关性）
+}
+
+// extractKeywords 使用 LLM 提取查询中的核心关键词和可选关键词
+func (s *searchService) extractKeywords(ctx context.Context, query string) (*KeywordExtractionResult, error) {
+	// 如果 LLM 客户端未配置，降级为简单分词
+	if s.llmClient == nil {
+		log.Warnf("[SearchService] LLM 客户端未配置，使用简单分词策略")
+		return s.fallbackKeywordExtraction(query), nil
 	}
-	return []map[string]interface{}{
-		{
-			"match_phrase": map[string]interface{}{
-				"text_content": map[string]interface{}{
-					"query": phrase,
-					"boost": 3.0,
+
+	prompt := fmt.Sprintf(`你是一个关键词提取专家。请从用户的问题中提取关键词，并分为两类：
+
+1. **核心关键词**：问题的主体，必须出现在搜索结果中（如产品名、技术名词、专有名词）
+2. **可选关键词**：辅助词汇，有助于提升相关性但不是必须的（如动词、形容词）
+
+用户问题："%s"
+
+请严格按照以下 JSON 格式返回，不要包含任何其他文字：
+{
+  "core": ["关键词1", "关键词2"],
+  "optional": ["关键词3", "关键词4"]
+}`, query)
+
+	messages := []llm.Message{
+		{Role: "user", Content: prompt},
+	}
+
+	response, err := s.llmClient.GenerateOneShot(ctx, messages)
+	if err != nil {
+		log.Warnf("[SearchService] LLM 关键词提取失败，降级为简单分词: %v", err)
+		return s.fallbackKeywordExtraction(query), nil
+	}
+
+	// 解析 JSON 响应
+	var result struct {
+		Core     []string `json:"core"`
+		Optional []string `json:"optional"`
+	}
+
+	// 尝试提取 JSON（LLM 可能返回带有额外文本的响应）
+	jsonStart := strings.Index(response, "{")
+	jsonEnd := strings.LastIndex(response, "}")
+	if jsonStart == -1 || jsonEnd == -1 {
+		log.Warnf("[SearchService] LLM 返回格式不正确，降级为简单分词")
+		return s.fallbackKeywordExtraction(query), nil
+	}
+
+	jsonStr := response[jsonStart : jsonEnd+1]
+	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+		log.Warnf("[SearchService] 解析 LLM 返回的 JSON 失败，降级为简单分词: %v", err)
+		return s.fallbackKeywordExtraction(query), nil
+	}
+
+	log.Infof("[SearchService] 关键词提取成功 - 核心: %v, 可选: %v", result.Core, result.Optional)
+	return &KeywordExtractionResult{
+		CoreKeywords:     result.Core,
+		OptionalKeywords: result.Optional,
+	}, nil
+}
+
+// fallbackKeywordExtraction 三层降级策略
+// 第二层：尝试使用分词器
+// 第三层：简单分词
+func (s *searchService) fallbackKeywordExtraction(query string) *KeywordExtractionResult {
+	// 第二层：尝试使用分词器（如果启用）
+	if s.segmenter != nil && s.segmenter.enabled {
+		core, optional := s.segmenter.SegmentWithPOSAdvanced(query)
+		if len(core) > 0 {
+			log.Infof("[SearchService] 使用分词器提取关键词 - 核心: %v, 可选: %v", core, optional)
+			return &KeywordExtractionResult{
+				CoreKeywords:     core,
+				OptionalKeywords: optional,
+			}
+		}
+		log.Warnf("[SearchService] 分词器未提取到关键词，降级到简单分词")
+	}
+
+	// 第三层：简单分词策略（兜底）
+	log.Infof("[SearchService] 使用简单分词策略（第三层兜底）")
+	words := strings.Fields(query)
+	if len(words) == 0 {
+		return &KeywordExtractionResult{
+			CoreKeywords:     []string{query},
+			OptionalKeywords: []string{},
+		}
+	}
+
+	// 简单规则：如果词数 <= 2，全部作为核心词；否则前 60% 作为核心词
+	coreCount := len(words)
+	if len(words) > 2 {
+		coreCount = (len(words) * 6) / 10
+		if coreCount == 0 {
+			coreCount = 1
+		}
+	}
+
+	return &KeywordExtractionResult{
+		CoreKeywords:     words[:coreCount],
+		OptionalKeywords: words[coreCount:],
+	}
+}
+
+// executeEsQuery 执行 ES 查询并解析结果
+func (s *searchService) executeEsQuery(ctx context.Context, queryBody map[string]interface{}) ([]model.EsDocument, error) {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(queryBody); err != nil {
+		return nil, fmt.Errorf("failed to encode query: %w", err)
+	}
+
+	res, err := s.esClient.Search(
+		s.esClient.Search.WithContext(ctx),
+		s.esClient.Search.WithIndex("knowledge_base"),
+		s.esClient.Search.WithBody(&buf),
+		s.esClient.Search.WithTrackTotalHits(true),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("es search failed: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.IsError() {
+		bodyBytes, _ := io.ReadAll(res.Body)
+		return nil, fmt.Errorf("es returned error: %s, body: %s", res.Status(), string(bodyBytes))
+	}
+
+	var esResponse struct {
+		Hits struct {
+			Hits []struct {
+				Source model.EsDocument `json:"_source"`
+				Score  float64          `json:"_score"`
+			} `json:"hits"`
+		} `json:"hits"`
+	}
+
+	if err := json.NewDecoder(res.Body).Decode(&esResponse); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	docs := make([]model.EsDocument, 0, len(esResponse.Hits.Hits))
+	for _, hit := range esResponse.Hits.Hits {
+		// 保留原始分数以便调试（可选）
+		docs = append(docs, hit.Source)
+	}
+
+	return docs, nil
+}
+
+// batchGetDocsByIDs 根据文档 ID 列表批量查询文档（用于缓存命中场景）
+func (s *searchService) batchGetDocsByIDs(ctx context.Context, docIDs []string, user *model.User, userEffectiveTags []string) ([]model.SearchResponseDTO, error) {
+	if len(docIDs) == 0 {
+		return []model.SearchResponseDTO{}, nil
+	}
+
+	// 构建 ES 查询：根据 vector_id 批量获取
+	idsQuery := map[string]interface{}{
+		"query": map[string]interface{}{
+			"bool": map[string]interface{}{
+				"must": map[string]interface{}{
+					"ids": map[string]interface{}{
+						"values": docIDs,
+					},
+				},
+				"filter": map[string]interface{}{
+					"bool": map[string]interface{}{
+						"should": []map[string]interface{}{
+							{"term": map[string]interface{}{"user_id": user.ID}},
+							{"term": map[string]interface{}{"is_public": true}},
+							{"terms": map[string]interface{}{"org_tag": userEffectiveTags}},
+						},
+						"minimum_should_match": 1,
+					},
 				},
 			},
 		},
+		"_source": []string{"file_md5", "chunk_id", "text_content", "user_id", "org_tag", "is_public", "vector_id"},
+		"size":    len(docIDs),
 	}
+
+	docs, err := s.executeEsQuery(ctx, idsQuery)
+	if err != nil {
+		return nil, fmt.Errorf("batch query by IDs failed: %w", err)
+	}
+
+	// 组装结果（需要查文件名）
+	fileMD5s := make([]string, 0, len(docs))
+	for _, doc := range docs {
+		fileMD5s = append(fileMD5s, doc.FileMD5)
+	}
+	uniqueMD5s := make(map[string]struct{})
+	for _, md5 := range fileMD5s {
+		uniqueMD5s[md5] = struct{}{}
+	}
+	md5List := make([]string, 0, len(uniqueMD5s))
+	for md5 := range uniqueMD5s {
+		md5List = append(md5List, md5)
+	}
+
+	fileInfos, _ := s.uploadRepo.FindBatchByMD5s(md5List)
+	fileNameMap := make(map[string]string)
+	for _, info := range fileInfos {
+		fileNameMap[info.FileMD5] = info.FileName
+	}
+
+	// 转换为 DTO
+	var results []model.SearchResponseDTO
+	for _, doc := range docs {
+		fileName := fileNameMap[doc.FileMD5]
+		if fileName == "" {
+			fileName = "未知文件"
+		}
+		dto := model.SearchResponseDTO{
+			FileMD5:     doc.FileMD5,
+			FileName:    fileName,
+			ChunkID:     doc.ChunkID,
+			TextContent: doc.TextContent,
+			Score:       1.0, // 缓存命中时用固定分数
+			UserID:      strconv.FormatUint(uint64(doc.UserID), 10),
+			OrgTag:      doc.OrgTag,
+			IsPublic:    doc.IsPublic,
+		}
+		results = append(results, dto)
+	}
+
+	return results, nil
+}
+
+// normalizeAndSort 规范化并排序关键词，用于生成缓存指纹
+func normalizeAndSort(keywords []string) []string {
+	if len(keywords) == 0 {
+		return []string{}
+	}
+
+	// 去重 + 转小写
+	uniqueKeys := make(map[string]bool)
+	for _, kw := range keywords {
+		normalized := strings.ToLower(strings.TrimSpace(kw))
+		if normalized != "" {
+			uniqueKeys[normalized] = true
+		}
+	}
+
+	// 转为 slice 并排序
+	result := make([]string, 0, len(uniqueKeys))
+	for kw := range uniqueKeys {
+		result = append(result, kw)
+	}
+	sort.Strings(result)
+
+	return result
+}
+
+// generateCacheKey 基于核心关键词生成缓存键
+func generateCacheKey(keywords *KeywordExtractionResult) string {
+	if keywords == nil || len(keywords.CoreKeywords) == 0 {
+		return ""
+	}
+
+	// 规范化并排序核心关键词
+	normalizedKeys := normalizeAndSort(keywords.CoreKeywords)
+	if len(normalizedKeys) == 0 {
+		return ""
+	}
+
+	// 生成指纹：前缀 + 关键词序列（用 | 分隔）
+	return "search_cache:" + strings.Join(normalizedKeys, "|")
 }

@@ -76,3 +76,8 @@ llm:
     temperature: 0.3
     max_tokens: 2000
     top_p: 0.9
+
+# 分词器配置（用于关键词提取降级策略）
+segmenter:
+  enabled: true  # 是否启用分词器作为 LLM 降级方案
+  dict: ""       # 自定义词典路径（可选，留空使用默认词典）

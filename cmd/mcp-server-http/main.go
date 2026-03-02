@@ -44,7 +44,7 @@ func main() {
 	rerankClient := rerank.NewClient(cfg.Rerank)
 
 	userService := service.NewUserService(userRepository, repository.NewOrgTagRepository(database.DB), nil)
-	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo, rerankClient)
+	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo, rerankClient, nil, config.SegmenterConfig{Enabled: false}, nil) // MCP 不需要关键词提取、分词和缓存
 
 	// 5. 获取默认用户（admin）用于MCP调用
 	defaultUser, err := userRepository.FindByUsername("admin")

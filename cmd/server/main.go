@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 )
 
 func main() {
@@ -72,8 +73,16 @@ func main() {
 	adminService := service.NewAdminService(orgTagRepo, userRepository, conversationRepo)
 	uploadService := service.NewUploadService(uploadRepo, userRepository, cfg.MinIO)
 	documentService := service.NewDocumentService(uploadRepo, userRepository, orgTagRepo, cfg.MinIO, tikaClient)
-	cacheService := service.NewContentCacheService()                                                               // Initialize CacheService
-	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo, rerankClient) // 注入 Rerank Client
+	cacheService := service.NewContentCacheService() // Initialize CacheService
+
+	// 初始化 Redis 客户端（用于检索结果缓存）
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     cfg.Database.Redis.Addr,
+		Password: cfg.Database.Redis.Password,
+		DB:       cfg.Database.Redis.DB,
+	})
+
+	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo, rerankClient, llmClient, cfg.Segmenter, redisClient) // 注入 Redis Client
 	conversationService := service.NewConversationService(conversationRepo)
 	chatService := service.NewChatService(searchService, llmClient, conversationRepo, cacheService)
 
