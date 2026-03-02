@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"pai-smart-go/internal/config"
 	"pai-smart-go/internal/model"
 	"pai-smart-go/internal/repository"
@@ -13,6 +15,11 @@ import (
 	"strings"
 	"time"
 
+	einomodel "github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/components/tool"
+	"github.com/cloudwego/eino/components/tool/utils"
+	"github.com/cloudwego/eino/compose"
+	"github.com/cloudwego/eino/schema"
 	"github.com/gorilla/websocket"
 )
 
@@ -51,65 +58,197 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 	answerBuilder := &strings.Builder{}
 	interceptor := &wsWriterInterceptor{conn: ws, writer: answerBuilder, shouldStop: shouldStop}
 
-	// Cache Check
+	// Cache Check 提前拦截（相当于短路）
 	if cachedAnswer, hit := s.cacheService.Get(ctx, query, history); hit {
-		// 如果命中缓存，模拟流式输出（或者直接一次性输出）
-		// 为了前端体验一致性，我们还是稍微 delay 一下或者切片发送，这里简化为直接发送
 		interceptor.WriteMessage(websocket.TextMessage, []byte(cachedAnswer))
-		// 发送完成信号
 		sendCompletion(ws)
-		// 也要保存到历史记录
 		s.addMessageToConversation(context.Background(), user.ID, query, cachedAnswer)
 		return nil
 	}
 
-	searchQuery := query
-	// 1. 如果有历史记录，进行查询重写 (Query Rewriting)
-	// 只有当查询较短或看起来依赖上下文时才重写，但为简单起见，这里总是尝试重写
-	if len(history) > 0 {
-		rewritten, err := s.rewriteQuery(ctx, query, history)
-		if err != nil {
-			log.Warnf("[ChatService] Query rewrite failed, using original query: %v", err)
+	// ============== EINO GRAPH ORCHESTRATION ==============
+	// 定义在各节点之间流转的全局状态
+	type RagState struct {
+		Query    string
+		User     *model.User
+		History  []model.ChatMessage
+		Messages []*schema.Message // 使用 Eino 原生 Message 数组
+	}
+
+	// 提前将历史记录组装为初始 messages
+	systemMsgText := s.buildSystemMessage("")
+	initialMsgs := s.composeMessages(systemMsgText, history, query)
+	var einoMsgs []*schema.Message
+	for _, m := range initialMsgs {
+		if m.Role == "user" {
+			einoMsgs = append(einoMsgs, schema.UserMessage(m.Content))
+		} else if m.Role == "assistant" {
+			einoMsgs = append(einoMsgs, schema.AssistantMessage(m.Content, nil))
 		} else {
-			log.Infof("[ChatService] Query rewritten: '%s' -> '%s'", query, rewritten)
-			searchQuery = rewritten
+			einoMsgs = append(einoMsgs, schema.SystemMessage(m.Content))
 		}
 	}
 
-	// 2. 使用 SearchService 检索上下文（使用改写后的查询）
-	results, err := s.searchService.HybridSearch(ctx, searchQuery, 10, user)
+	initState := &RagState{
+		Query:    query,
+		User:     user,
+		History:  history,
+		Messages: einoMsgs,
+	}
+
+	// 将 Context 注入用户信息给 Retriever 使用
+	ctx = WithUserContext(ctx, user)
+
+	// 1. Convert SearchService to Eino Retriever
+	retrieverTool := s.searchService.AsEinoRetriever()
+
+	// 2. Wrap tools into Eino InvokableTool
+	type SearchToolInput struct {
+		Query string `json:"query" jsonschema:"description=提取的核心搜索关键词汇,说明:需要检索什么样的内容"`
+	}
+	searchTool, err := utils.InferTool("search_knowledge_base", "当遇到需要查询内部政策、指南、请假规范等非通用知识库内容时，优先调用此工具检索对应文档，提供关键词获取文档背景知识", func(ctx context.Context, input *SearchToolInput) (string, error) {
+		log.Infof("[ChatService-Agent] Triggered tool search_knowledge_base, query: '%s'", input.Query)
+		docs, err := retrieverTool.Retrieve(ctx, input.Query)
+		if err != nil {
+			return "", err
+		}
+		if len(docs) == 0 {
+			return "没有相关的知识库文档可以参考。", nil
+		}
+		var res strings.Builder
+		for i, d := range docs {
+			res.WriteString(fmt.Sprintf("[%d] %s\n", i+1, d.Content))
+		}
+		return res.String(), nil
+	})
 	if err != nil {
-		return fmt.Errorf("failed to retrieve context: %w", err)
+		return fmt.Errorf("failed to create search tool: %v", err)
 	}
 
-	// 3. 构建上下文与 system 消息
-	contextText := s.buildContextText(results)
-	systemMsg := s.buildSystemMessage(contextText)
-	messages := s.composeMessages(systemMsg, history, query) // 对话显示仍用原始 query，保持用户体验一致
-
-	// 3. 调用 LLM 客户端以流式传输响应（带生成参数）
-	gen := s.buildGenerationParams()
-	var llmMsgs []llm.Message
-	for _, m := range messages {
-		llmMsgs = append(llmMsgs, llm.Message{Role: m.Role, Content: m.Content})
+	type WeatherToolInput struct {
+		Location string `json:"location" jsonschema:"description=需要查询天气的城市名称或拼音,例如 北京, Beijing, Shanghai"`
 	}
-	err = s.llmClient.StreamChatMessages(ctx, llmMsgs, gen, interceptor)
+	weatherTool, err := utils.InferTool("get_weather", "当用户询问特定地点的当前天气时调用此工具,需提供地名", func(ctx context.Context, input *WeatherToolInput) (string, error) {
+		log.Infof("[ChatService-Agent] Triggered tool get_weather, location: '%s'", input.Location)
+		url := fmt.Sprintf("https://wttr.in/%s?format=3", input.Location)
+		resp, err := http.Get(url)
+		if err != nil {
+			return "", fmt.Errorf("failed to fetch weather: %v", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", fmt.Errorf("failed to read weather response: %v", err)
+		}
+		return string(body), nil
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create weather tool: %v", err)
 	}
 
-	// 4. 发送完成通知，并将对话保存到 Redis
+	// 3. 构造 ToolsNode
+	toolsNode, err := compose.NewToolNode(ctx, &compose.ToolsNodeConfig{
+		Tools: []tool.BaseTool{searchTool, weatherTool},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create tools node: %v", err)
+	}
+
+	// 4. 初始化 Eino Graph
+	graph := compose.NewGraph[*RagState, *RagState]()
+
+	// Chat 核心推理节点
+	graph.AddLambdaNode("chat_node", compose.InvokableLambda(func(ctx context.Context, state *RagState) (*RagState, error) {
+		einoModel := s.llmClient.AsEinoChatModel()
+		searchToolInfo, _ := searchTool.Info(ctx)
+		weatherToolInfo, _ := weatherTool.Info(ctx)
+
+		streamReader, err := einoModel.Stream(ctx, state.Messages, einomodel.WithTools([]*schema.ToolInfo{searchToolInfo, weatherToolInfo}))
+		if err != nil {
+			return nil, fmt.Errorf("llm stream failed: %w", err)
+		}
+		defer streamReader.Close()
+
+		var isToolCall bool
+		var fullMessage *schema.Message
+
+		for {
+			chunk, err := streamReader.Recv()
+			if err != nil {
+				if err.Error() == "EOF" || strings.Contains(err.Error(), "EOF") {
+					break
+				}
+				// Allow standard eof or stream close
+				break
+			}
+
+			if len(chunk.ToolCalls) > 0 {
+				isToolCall = true
+			}
+
+			// Streaming chunk content to the user only if it's not a tool call
+			if !isToolCall && chunk.Content != "" {
+				interceptor.WriteMessage(websocket.TextMessage, []byte(chunk.Content))
+			}
+
+			if fullMessage == nil {
+				fullMessage = chunk
+			} else {
+				fullMessage, _ = schema.ConcatMessages([]*schema.Message{fullMessage, chunk})
+			}
+		}
+
+		if fullMessage != nil {
+			state.Messages = append(state.Messages, fullMessage)
+		}
+		return state, nil
+	}))
+
+	// 工具执行节点
+	graph.AddLambdaNode("tools_node", compose.InvokableLambda(func(ctx context.Context, state *RagState) (*RagState, error) {
+		lastMsg := state.Messages[len(state.Messages)-1]
+		toolMessages, err := toolsNode.Invoke(ctx, lastMsg)
+		if err != nil {
+			return nil, fmt.Errorf("tools execution failed: %w", err)
+		}
+		state.Messages = append(state.Messages, toolMessages...)
+		return state, nil
+	}))
+
+	// 分支路由：判断是否有工具调用
+	graph.AddBranch("chat_node", compose.NewGraphBranch(func(ctx context.Context, state *RagState) (string, error) {
+		lastMsg := state.Messages[len(state.Messages)-1]
+		if len(lastMsg.ToolCalls) > 0 {
+			return "tools_node", nil
+		}
+		return "END", nil
+	}, map[string]bool{"tools_node": true, "END": true}))
+
+	// 闭环连接：工具执行完回到模型推理
+	graph.AddEdge("tools_node", "chat_node")
+	graph.AddEdge(compose.START, "chat_node")
+
+	// 编译并执行 Agent Workflow
+	workflow, err := graph.Compile(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to compile agent graph: %v", err)
+	}
+
+	_, err = workflow.Invoke(ctx, initState)
+	if err != nil {
+		return fmt.Errorf("agent workflow execution failed: %v", err)
+	}
+	// ======================================================
+
+	// 5. 发送完成通知，并将对话保存到 Redis
 	sendCompletion(ws)
 	fullAnswer := answerBuilder.String()
 	if len(fullAnswer) > 0 {
-		// 使用后台上下文，因为即使原始请求被取消，我们也希望保存成功生成的答案
 		bgCtx := context.Background()
 		err = s.addMessageToConversation(bgCtx, user.ID, query, fullAnswer)
 		if err != nil {
-			// 只记录错误，不返回给客户端，因为流式响应已经成功
 			log.Errorf("Failed to save conversation history: %v", err)
 		}
-		// 保存到缓存
 		s.cacheService.Set(bgCtx, query, history, fullAnswer)
 	}
 

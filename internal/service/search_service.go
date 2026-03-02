@@ -20,13 +20,33 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cloudwego/eino/components/retriever"
+	"github.com/cloudwego/eino/schema"
 	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/go-redis/redis/v8"
 )
 
+// UserContextKey 用于在 Context 中传递用户信息
+type UserContextKey struct{}
+
+var userCtxKey = UserContextKey{}
+
+// WithUserContext 将用户信息放入 Context 中
+func WithUserContext(ctx context.Context, user *model.User) context.Context {
+	return context.WithValue(ctx, userCtxKey, user)
+}
+
+// UserFromContext 从 Context 中获取用户信息
+func UserFromContext(ctx context.Context) *model.User {
+	user, _ := ctx.Value(userCtxKey).(*model.User)
+	return user
+}
+
 // SearchService 接口定义了搜索操作。
 type SearchService interface {
 	HybridSearch(ctx context.Context, query string, topK int, user *model.User) ([]model.SearchResponseDTO, error)
+	// AsEinoRetriever 返回一个适配 Eino 框架的组件
+	AsEinoRetriever() retriever.Retriever
 }
 
 type searchService struct {
@@ -695,4 +715,51 @@ func generateCacheKey(keywords *KeywordExtractionResult) string {
 
 	// 生成指纹：前缀 + 关键词序列（用 | 分隔）
 	return "search_cache:" + strings.Join(normalizedKeys, "|")
+}
+
+// einoRetriever 包装现有的 SearchService，适配 Eino Retriever 接口
+type einoRetriever struct {
+	svc *searchService
+}
+
+// Retrieve 实现 Eino 的 retriever.Retriever 接口
+func (r *einoRetriever) Retrieve(ctx context.Context, query string, opts ...retriever.Option) ([]*schema.Document, error) {
+	// 从 Context 中提取请求上下文的用户信息
+	user := UserFromContext(ctx)
+	if user == nil {
+		return nil, fmt.Errorf("user info not found in context")
+	}
+
+	// 提取 TopK（可以从 opts 解析，如果没有则定一个默认 10）
+	topK := 10
+	configOpts := retriever.GetCommonOptions(&retriever.Options{}, opts...)
+	if configOpts != nil && configOpts.TopK != nil {
+		topK = *configOpts.TopK
+	}
+
+	results, err := r.svc.HybridSearch(ctx, query, topK, user)
+	if err != nil {
+		return nil, err
+	}
+
+	// 将结果转化为 Eino Schema
+	var einoDocs []*schema.Document
+	for _, res := range results {
+		doc := &schema.Document{
+			ID:      fmt.Sprint(res.ChunkID),
+			Content: fmt.Sprintf("[Filename: %s]\n%s", res.FileName, res.TextContent),
+			MetaData: map[string]any{
+				"file_md5":  res.FileMD5,
+				"file_name": res.FileName,
+				"score":     res.Score,
+			},
+		}
+		einoDocs = append(einoDocs, doc)
+	}
+
+	return einoDocs, nil
+}
+
+func (s *searchService) AsEinoRetriever() retriever.Retriever {
+	return &einoRetriever{svc: s}
 }

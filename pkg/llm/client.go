@@ -2,16 +2,14 @@
 package llm
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"pai-smart-go/internal/config"
-	"strings"
 
+	"github.com/cloudwego/eino-ext/components/model/openai"
+	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/schema"
 	"github.com/gorilla/websocket"
 )
 
@@ -29,18 +27,33 @@ type Client interface {
 	GenerateOneShot(ctx context.Context, messages []Message) (string, error)
 	// 为兼容旧调用，保留 StreamChat：由内部包装为 messages 调用。
 	StreamChat(ctx context.Context, prompt string, writer MessageWriter) error
+	// AsEinoChatModel 返回底层的 Eino ChatModel，以便接入 Eino Graph 编排。
+	AsEinoChatModel() model.ChatModel
 }
 
-type deepseekClient struct {
-	cfg    config.LLMConfig
-	client *http.Client
+type einoClient struct {
+	cfg       config.LLMConfig
+	chatModel model.ChatModel
+}
+
+func (c *einoClient) AsEinoChatModel() model.ChatModel {
+	return c.chatModel
 }
 
 // NewClient creates a new LLM client based on the provider in the config.
 func NewClient(cfg config.LLMConfig) Client {
-	return &deepseekClient{
-		cfg:    cfg,
-		client: &http.Client{},
+	chatModel, err := openai.NewChatModel(context.Background(), &openai.ChatModelConfig{
+		BaseURL: cfg.BaseURL,
+		APIKey:  cfg.APIKey,
+		Model:   cfg.Model,
+	})
+	if err != nil {
+		panic(fmt.Sprintf("failed to initialize eino chat model: %v", err))
+	}
+
+	return &einoClient{
+		cfg:       cfg,
+		chatModel: chatModel,
 	}
 }
 
@@ -48,31 +61,6 @@ func NewClient(cfg config.LLMConfig) Client {
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
-}
-
-type chatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Stream      bool      `json:"stream"`
-	Temperature *float64  `json:"temperature,omitempty"`
-	TopP        *float64  `json:"top_p,omitempty"`
-	MaxTokens   *int      `json:"max_tokens,omitempty"`
-}
-
-type chatResponse struct {
-	Choices []struct {
-		Delta struct {
-			Content string `json:"content"`
-		} `json:"delta"`
-	} `json:"choices"`
-}
-
-type oneShotResponse struct {
-	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
 }
 
 // GenerationParams 控制生成行为
@@ -83,135 +71,103 @@ type GenerationParams struct {
 }
 
 // GenerateOneShot calls the API for a non-streaming completion.
-func (c *deepseekClient) GenerateOneShot(ctx context.Context, messages []Message) (string, error) {
-	reqBody := chatRequest{
-		Model:    c.cfg.Model,
-		Messages: messages,
-		Stream:   false,
-	}
-
-	reqBytes, err := json.Marshal(reqBody)
+func (c *einoClient) GenerateOneShot(ctx context.Context, messages []Message) (string, error) {
+	einoMsgs, err := convertMessages(messages)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal chat request: %w", err)
+		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", c.cfg.BaseURL+"/chat/completions", bytes.NewReader(reqBytes))
+	opts := c.buildOptions(nil)
+	resp, err := c.chatModel.Generate(ctx, einoMsgs, opts...)
 	if err != nil {
-		return "", fmt.Errorf("failed to create chat request: %w", err)
+		return "", fmt.Errorf("eino GenerateOneShot failed: %w", err)
+	}
+	if resp == nil {
+		return "", fmt.Errorf("empty choice in response")
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to call chat api: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("chat api returned non-200 status: %s, body: %s", resp.Status, string(bodyBytes))
-	}
-
-	var parsedResp oneShotResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsedResp); err != nil {
-		return "", fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if len(parsedResp.Choices) == 0 {
-		return "", fmt.Errorf("empty choices in response")
-	}
-
-	return parsedResp.Choices[0].Message.Content, nil
+	return resp.Content, nil
 }
 
-// StreamChat calls the DeepSeek API for chat completions and streams the response.
-func (c *deepseekClient) StreamChat(ctx context.Context, prompt string, writer MessageWriter) error {
-	// 兼容旧接口：仅发送一条 user 消息，不带生成参数
+// StreamChat calls the API for chat completions and streams the response.
+func (c *einoClient) StreamChat(ctx context.Context, prompt string, writer MessageWriter) error {
 	return c.StreamChatMessages(ctx, []Message{{Role: "user", Content: prompt}}, nil, writer)
 }
 
-func (c *deepseekClient) StreamChatMessages(ctx context.Context, messages []Message, gen *GenerationParams, writer MessageWriter) error {
-	reqBody := chatRequest{
-		Model:    c.cfg.Model,
-		Messages: messages,
-		Stream:   true,
-	}
-	// 从配置或传参注入生成参数（传参优先生效）
-	if gen != nil {
-		reqBody.Temperature = gen.Temperature
-		reqBody.TopP = gen.TopP
-		reqBody.MaxTokens = gen.MaxTokens
-	} else {
-		// 从全局配置注入（若非零值）
-		if c.cfg.Generation.Temperature != 0 {
-			t := c.cfg.Generation.Temperature
-			reqBody.Temperature = &t
-		}
-		if c.cfg.Generation.TopP != 0 {
-			p := c.cfg.Generation.TopP
-			reqBody.TopP = &p
-		}
-		if c.cfg.Generation.MaxTokens != 0 {
-			m := c.cfg.Generation.MaxTokens
-			reqBody.MaxTokens = &m
-		}
-	}
-
-	reqBytes, err := json.Marshal(reqBody)
+func (c *einoClient) StreamChatMessages(ctx context.Context, messages []Message, gen *GenerationParams, writer MessageWriter) error {
+	einoMsgs, err := convertMessages(messages)
 	if err != nil {
-		return fmt.Errorf("failed to marshal chat request: %w", err)
+		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", c.cfg.BaseURL+"/chat/completions", bytes.NewReader(reqBytes))
+	opts := c.buildOptions(gen)
+
+	streamReader, err := c.chatModel.Stream(ctx, einoMsgs, opts...)
 	if err != nil {
-		return fmt.Errorf("failed to create chat request: %w", err)
+		return fmt.Errorf("eino StreamChat failed: %w", err)
 	}
+	defer streamReader.Close()
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
-	req.Header.Set("Accept", "text/event-stream")
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to call chat api: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("chat api returned non-200 status: %s, body: %s", resp.Status, string(bodyBytes))
-	}
-
-	reader := bufio.NewReader(resp.Body)
 	for {
-		line, err := reader.ReadString('\n')
+		chunk, err := streamReader.Recv()
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			return fmt.Errorf("failed to read from stream: %w", err)
+			return fmt.Errorf("failed to read from eino stream: %w", err)
 		}
-
-		if strings.HasPrefix(line, "data: ") {
-			data := strings.TrimPrefix(line, "data: ")
-			if strings.TrimSpace(data) == "[DONE]" {
-				break
-			}
-
-			var chunk chatResponse
-			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-				continue
-			}
-
-			if len(chunk.Choices) > 0 {
-				content := chunk.Choices[0].Delta.Content
-				if err := writer.WriteMessage(websocket.TextMessage, []byte(content)); err != nil {
-					return fmt.Errorf("failed to write message to websocket: %w", err)
-				}
+		if chunk != nil && chunk.Content != "" {
+			if err := writer.WriteMessage(websocket.TextMessage, []byte(chunk.Content)); err != nil {
+				return fmt.Errorf("failed to write message to websocket: %w", err)
 			}
 		}
 	}
 	return nil
+}
+
+func convertMessages(msgs []Message) ([]*schema.Message, error) {
+	var einoMsgs []*schema.Message
+	for _, m := range msgs {
+		role := schema.User
+		switch m.Role {
+		case "user":
+			role = schema.User
+		case "assistant":
+			role = schema.Assistant
+		case "system":
+			role = schema.System
+		}
+		einoMsgs = append(einoMsgs, &schema.Message{
+			Role:    role,
+			Content: m.Content,
+		})
+	}
+	return einoMsgs, nil
+}
+
+func (c *einoClient) buildOptions(gen *GenerationParams) []model.Option {
+	var opts []model.Option
+	if gen != nil {
+		if gen.Temperature != nil {
+			opts = append(opts, model.WithTemperature(float32(*gen.Temperature)))
+		}
+		if gen.TopP != nil {
+			opts = append(opts, model.WithTopP(float32(*gen.TopP)))
+		}
+		if gen.MaxTokens != nil {
+			opts = append(opts, model.WithMaxTokens(*gen.MaxTokens))
+		}
+	} else {
+		// 从全局配置注入（若非零值）
+		if c.cfg.Generation.Temperature != 0 {
+			opts = append(opts, model.WithTemperature(float32(c.cfg.Generation.Temperature)))
+		}
+		if c.cfg.Generation.TopP != 0 {
+			opts = append(opts, model.WithTopP(float32(c.cfg.Generation.TopP)))
+		}
+		if c.cfg.Generation.MaxTokens != 0 {
+			opts = append(opts, model.WithMaxTokens(c.cfg.Generation.MaxTokens))
+		}
+	}
+	return opts
 }
