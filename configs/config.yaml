@@ -44,16 +44,16 @@ elasticsearch:
 # Embedding model config
 embedding:
   model: "text-embedding-v4"
-  api_key: ""
+  api_key: "sk-6f83184867514c0fb4ead4d31ec11303"
   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
   dimensions: 2048
 
 # Rerank model config
 rerank:
   enable: true
-  model: "bge-reranker-v2-m3" # 示例模型名
-  api_key: "sk-xxxxxx" # 请替换为您的 Key
-  base_url: "https://api.siliconflow.cn/v1/rerank" # 示例地址（如硅基流动/Jina）
+  model: "qwen3-rerank" # 示例模型名
+  api_key: "sk-6f83184867514c0fb4ead4d31ec11303" # 请替换为您的 Key
+  base_url: "https://dashscope.aliyuncs.com/compatible-api/v1/reranks" # 示例地址（如硅基流动/Jina）
   min_score: 0.3 # 低于此分数的会被过滤掉
 
 # LLM config
@@ -63,7 +63,7 @@ llm:
   api_key: "sk-7d18e7cc656041e18062e8ce86bf0d7c"
   prompt:
     rules: |
-      你是派聪明知识助手，须遵守：
+      你是知识助手，须遵守：
       1. 仅用简体中文作答。
       2. 回答需先给结论，再给论据。
       3. 如引用参考信息，请在句末加 (来源#编号: 文件名)。

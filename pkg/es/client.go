@@ -75,7 +75,7 @@ func createIndexIfNotExists(indexName string) error {
 					"index": true,
 					"similarity": "cosine",
 					"index_options": {
-						"type": "int8_hnsw",
+						"type": "hnsw",
 						"m": 24,
 						"ef_construction": 128
 					}

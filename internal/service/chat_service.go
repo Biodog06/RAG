@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"pai-smart-go/internal/config"
 	"pai-smart-go/internal/model"
 	"pai-smart-go/internal/repository"
@@ -15,12 +13,12 @@ import (
 	"strings"
 	"time"
 
-	einomodel "github.com/cloudwego/eino/components/model"
-	"github.com/cloudwego/eino/components/tool"
-	"github.com/cloudwego/eino/components/tool/utils"
-	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 	"github.com/gorilla/websocket"
+
+	"pai-smart-go/internal/agent/graph"
+	"pai-smart-go/internal/agent/state"
+	"pai-smart-go/internal/agent/tools"
 )
 
 // ChatService 定义了聊天操作的接口。
@@ -67,14 +65,8 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 	}
 
 	// ============== EINO GRAPH ORCHESTRATION ==============
-	// 定义在各节点之间流转的全局状态
-	type RagState struct {
-		Query    string
-		User     *model.User
-		History  []model.ChatMessage
-		Messages []*schema.Message // 使用 Eino 原生 Message 数组
-	}
 
+	// ============== EINO GRAPH ORCHESTRATION ==============
 	// 提前将历史记录组装为初始 messages
 	systemMsgText := s.buildSystemMessage("")
 	initialMsgs := s.composeMessages(systemMsgText, history, query)
@@ -89,7 +81,7 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 		}
 	}
 
-	initState := &RagState{
+	initState := &state.RagState{
 		Query:    query,
 		User:     user,
 		History:  history,
@@ -99,148 +91,46 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 	// 将 Context 注入用户信息给 Retriever 使用
 	ctx = WithUserContext(ctx, user)
 
-	// 1. Convert SearchService to Eino Retriever
+	// 初始化各 Tool (建议在 Service 初始化时完成，避免每个请求都新建)
 	retrieverTool := s.searchService.AsEinoRetriever()
-
-	// 2. Wrap tools into Eino InvokableTool
-	type SearchToolInput struct {
-		Query string `json:"query" jsonschema:"description=提取的核心搜索关键词汇,说明:需要检索什么样的内容"`
-	}
-	searchTool, err := utils.InferTool("search_knowledge_base", "当遇到需要查询内部政策、指南、请假规范等非通用知识库内容时，优先调用此工具检索对应文档，提供关键词获取文档背景知识", func(ctx context.Context, input *SearchToolInput) (string, error) {
-		log.Infof("[ChatService-Agent] Triggered tool search_knowledge_base, query: '%s'", input.Query)
-		docs, err := retrieverTool.Retrieve(ctx, input.Query)
-		if err != nil {
-			return "", err
-		}
-		if len(docs) == 0 {
-			return "没有相关的知识库文档可以参考。", nil
-		}
-		var res strings.Builder
-		for i, d := range docs {
-			res.WriteString(fmt.Sprintf("[%d] %s\n", i+1, d.Content))
-		}
-		return res.String(), nil
-	})
+	searchTool, err := tools.NewSearchTool(retrieverTool)
 	if err != nil {
 		return fmt.Errorf("failed to create search tool: %v", err)
 	}
 
-	type WeatherToolInput struct {
-		Location string `json:"location" jsonschema:"description=需要查询天气的城市名称或拼音,例如 北京, Beijing, Shanghai"`
-	}
-	weatherTool, err := utils.InferTool("get_weather", "当用户询问特定地点的当前天气时调用此工具,需提供地名", func(ctx context.Context, input *WeatherToolInput) (string, error) {
-		log.Infof("[ChatService-Agent] Triggered tool get_weather, location: '%s'", input.Location)
-		url := fmt.Sprintf("https://wttr.in/%s?format=3", input.Location)
-		resp, err := http.Get(url)
-		if err != nil {
-			return "", fmt.Errorf("failed to fetch weather: %v", err)
-		}
-		defer resp.Body.Close()
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return "", fmt.Errorf("failed to read weather response: %v", err)
-		}
-		return string(body), nil
-	})
+	weatherTool, err := tools.NewWeatherTool()
 	if err != nil {
 		return fmt.Errorf("failed to create weather tool: %v", err)
 	}
 
-	// 3. 构造 ToolsNode
-	toolsNode, err := compose.NewToolNode(ctx, &compose.ToolsNodeConfig{
-		Tools: []tool.BaseTool{searchTool, weatherTool},
-	})
+	webSearchTool, err := tools.NewWebSearchTool()
 	if err != nil {
-		return fmt.Errorf("failed to create tools node: %v", err)
+		return fmt.Errorf("failed to create web search tool: %v", err)
 	}
 
-	// 4. 初始化 Eino Graph
-	graph := compose.NewGraph[*RagState, *RagState]()
-
-	// Chat 核心推理节点
-	graph.AddLambdaNode("chat_node", compose.InvokableLambda(func(ctx context.Context, state *RagState) (*RagState, error) {
-		einoModel := s.llmClient.AsEinoChatModel()
-		searchToolInfo, _ := searchTool.Info(ctx)
-		weatherToolInfo, _ := weatherTool.Info(ctx)
-
-		streamReader, err := einoModel.Stream(ctx, state.Messages, einomodel.WithTools([]*schema.ToolInfo{searchToolInfo, weatherToolInfo}))
-		if err != nil {
-			return nil, fmt.Errorf("llm stream failed: %w", err)
-		}
-		defer streamReader.Close()
-
-		var isToolCall bool
-		var fullMessage *schema.Message
-
-		for {
-			chunk, err := streamReader.Recv()
-			if err != nil {
-				if err.Error() == "EOF" || strings.Contains(err.Error(), "EOF") {
-					break
-				}
-				// Allow standard eof or stream close
-				break
-			}
-
-			if len(chunk.ToolCalls) > 0 {
-				isToolCall = true
-			}
-
-			// Streaming chunk content to the user only if it's not a tool call
-			if !isToolCall && chunk.Content != "" {
-				interceptor.WriteMessage(websocket.TextMessage, []byte(chunk.Content))
-			}
-
-			if fullMessage == nil {
-				fullMessage = chunk
-			} else {
-				fullMessage, _ = schema.ConcatMessages([]*schema.Message{fullMessage, chunk})
-			}
-		}
-
-		if fullMessage != nil {
-			state.Messages = append(state.Messages, fullMessage)
-		}
-		return state, nil
-	}))
-
-	// 工具执行节点
-	graph.AddLambdaNode("tools_node", compose.InvokableLambda(func(ctx context.Context, state *RagState) (*RagState, error) {
-		lastMsg := state.Messages[len(state.Messages)-1]
-		toolMessages, err := toolsNode.Invoke(ctx, lastMsg)
-		if err != nil {
-			return nil, fmt.Errorf("tools execution failed: %w", err)
-		}
-		state.Messages = append(state.Messages, toolMessages...)
-		return state, nil
-	}))
-
-	// 分支路由：判断是否有工具调用
-	graph.AddBranch("chat_node", compose.NewGraphBranch(func(ctx context.Context, state *RagState) (string, error) {
-		lastMsg := state.Messages[len(state.Messages)-1]
-		if len(lastMsg.ToolCalls) > 0 {
-			return "tools_node", nil
-		}
-		return "END", nil
-	}, map[string]bool{"tools_node": true, "END": true}))
-
-	// 闭环连接：工具执行完回到模型推理
-	graph.AddEdge("tools_node", "chat_node")
-	graph.AddEdge(compose.START, "chat_node")
-
-	// 编译并执行 Agent Workflow
-	workflow, err := graph.Compile(ctx)
+	// 编译并初始化 Workflow
+	workflow, err := graph.CompileAgentGraph(ctx, &graph.AgentConfig{
+		LLMClient:     s.llmClient,
+		SearchTool:    searchTool,
+		WeatherTool:   weatherTool,
+		WebSearchTool: webSearchTool,
+	}, func(chunk string) {
+		interceptor.WriteMessage(websocket.TextMessage, []byte(chunk))
+	})
 	if err != nil {
 		return fmt.Errorf("failed to compile agent graph: %v", err)
 	}
 
+	log.Infof("[ChatService-Agent] Started executing workflow for query %s", query)
 	_, err = workflow.Invoke(ctx, initState)
 	if err != nil {
 		return fmt.Errorf("agent workflow execution failed: %v", err)
 	}
+
+	// 在原流水线中提取出拼接完成的内容给回答和外部（仅作占位或存储对话所需数据）
 	// ======================================================
 
-	// 5. 发送完成通知，并将对话保存到 Redis
+	// 5. 发送完成通知，并将对话保存到 Redis 与 Cache
 	sendCompletion(ws)
 	fullAnswer := answerBuilder.String()
 	if len(fullAnswer) > 0 {
