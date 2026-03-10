@@ -24,6 +24,7 @@ type Config struct {
 	LLM           LLMConfig           `mapstructure:"llm"`
 	AI            AIConfig            `mapstructure:"ai"`
 	Rerank        RerankConfig        `mapstructure:"rerank"`
+	Segmenter     SegmenterConfig     `mapstructure:"segmenter"` // 新增：分词器配置
 }
 
 // ServerConfig 存储服务器相关的配置。
@@ -150,6 +151,12 @@ type AIPromptConfig struct {
 	RefStart     string `mapstructure:"ref-start"`
 	RefEnd       string `mapstructure:"ref-end"`
 	NoResultText string `mapstructure:"no-result-text"`
+}
+
+// SegmenterConfig 存储分词器相关的配置
+type SegmenterConfig struct {
+	Enabled bool   `mapstructure:"enabled"` // 是否启用分词器
+	Dict    string `mapstructure:"dict"`    // 自定义词典路径（可选）
 }
 
 // Init 初始化配置加载，从指定的路径读取 YAML 文件并解析到 Conf 变量中。
