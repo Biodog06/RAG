@@ -12,9 +12,11 @@ import (
 	"pai-smart-go/pkg/embedding"
 	"pai-smart-go/pkg/es"
 	"pai-smart-go/pkg/log"
+	"pai-smart-go/pkg/splitter"
 	"pai-smart-go/pkg/storage"
 	"pai-smart-go/pkg/tasks"
 	"pai-smart-go/pkg/tika"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/minio/minio-go/v7"
@@ -94,7 +96,7 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 
 	// 3. 文本切块
 	log.Info("[Processor] 步骤3: 进行文本分块, chunkSize: 1000, chunkOverlap: 100")
-	chunks := p.splitText(textContent, 1000, 100)
+	chunks := p.splitText(textContent, 1000, 100, task.FileName)
 	log.Infof("[Processor] 步骤3: 文本分块完成, 共生成 %d 个分块", len(chunks))
 	if len(chunks) == 0 {
 		log.Warnf("[Processor] 未生成任何文本分块, 处理中止, FileName: %s", task.FileName)
@@ -172,8 +174,20 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 }
 
 // splitText 将长文本按指定大小和重叠进行切分。
-// (与Java的CharacterTextSplitter逻辑保持一致)
-func (p *Processor) splitText(text string, chunkSize int, chunkOverlap int) []string {
+// 对于 Markdown 文件，使用标题感知的 MarkdownSplitter；其他格式使用简单字符切分。
+func (p *Processor) splitText(text string, chunkSize int, chunkOverlap int, fileName string) []string {
+	// 判断是否为 Markdown 文件
+	if isMarkdownFile(fileName) {
+		log.Infof("[Processor] 检测到 Markdown 文件, 使用 MarkdownSplitter: %s", fileName)
+		mdSplitter := splitter.NewMarkdownSplitter()
+		chunks := mdSplitter.Split(text, chunkSize, chunkOverlap)
+		if len(chunks) > 0 {
+			return chunks
+		}
+		log.Warnf("[Processor] MarkdownSplitter 未生成分块，降级为简单切分")
+	}
+
+	// 默认：简单字符切分
 	if chunkSize <= chunkOverlap {
 		// Fallback to simple split if overlap is invalid
 		return p.simpleSplit(text, chunkSize)
@@ -213,4 +227,10 @@ func (p *Processor) simpleSplit(text string, chunkSize int) []string {
 		chunks = append(chunks, string(runes[i:end]))
 	}
 	return chunks
+}
+
+// isMarkdownFile 判断文件是否为 Markdown 格式
+func isMarkdownFile(fileName string) bool {
+	lower := strings.ToLower(fileName)
+	return strings.HasSuffix(lower, ".md") || strings.HasSuffix(lower, ".markdown")
 }

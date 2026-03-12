@@ -121,17 +121,53 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 		}
 	}
 
-	// 3. 向量化查询（用原始用户问句，保持语义检索能力）
-	log.Info("[SearchService] 步骤3: 开始向量化查询")
-	queryVector, err := s.embeddingClient.CreateEmbedding(ctx, query)
+	// 3. 查询重写（Multi-Query）：生成多个变体查询以提升召回率
+	log.Info("[SearchService] 步骤3: 查询重写 (Multi-Query)")
+	allQueries := []string{query} // 始终包含原始查询
+	rewrittenQueries, err := s.rewriteQueries(ctx, query)
 	if err != nil {
-		log.Errorf("[SearchService] 向量化查询失败: %v", err)
-		return nil, fmt.Errorf("failed to create query embedding: %w", err)
+		log.Warnf("[SearchService] 查询重写失败，仅使用原始查询: %v", err)
+	} else if len(rewrittenQueries) > 0 {
+		allQueries = append(allQueries, rewrittenQueries...)
+		log.Infof("[SearchService] 查询重写完成，共 %d 个查询变体: %v", len(rewrittenQueries), rewrittenQueries)
 	}
-	log.Infof("[SearchService] 步骤3: 向量化查询成功, 向量维度: %d", len(queryVector))
 
-	// 4. 并行执行多路召回 (Vector Search + Keyword Search)
-	log.Info("[SearchService] 步骤4: 并行执行多路召回 (Vector + Keyword)")
+	// 4. 向量化所有查询（并行）
+	log.Info("[SearchService] 步骤4: 开始向量化所有查询")
+	type queryVectorResult struct {
+		Query  string
+		Vector []float32
+		Err    error
+	}
+	vectorResults := make([]queryVectorResult, len(allQueries))
+	var vecWg sync.WaitGroup
+	for i, q := range allQueries {
+		vecWg.Add(1)
+		go func(idx int, qText string) {
+			defer vecWg.Done()
+			vec, err := s.embeddingClient.CreateEmbedding(ctx, qText)
+			vectorResults[idx] = queryVectorResult{Query: qText, Vector: vec, Err: err}
+		}(i, q)
+	}
+	vecWg.Wait()
+
+	// 收集成功的向量
+	var queryVectors [][]float32
+	for _, vr := range vectorResults {
+		if vr.Err != nil {
+			log.Warnf("[SearchService] 查询 '%s' 向量化失败: %v", vr.Query, vr.Err)
+			continue
+		}
+		queryVectors = append(queryVectors, vr.Vector)
+	}
+	if len(queryVectors) == 0 {
+		log.Errorf("[SearchService] 所有查询向量化均失败")
+		return nil, fmt.Errorf("failed to create query embeddings for all queries")
+	}
+	log.Infof("[SearchService] 步骤4: 向量化完成, 成功 %d/%d", len(queryVectors), len(allQueries))
+
+	// 5. 并行执行多路召回 (Multi-Vector Search + Keyword Search)
+	log.Info("[SearchService] 步骤5: 并行执行多路召回")
 
 	const (
 		rrfK       = 60.0
@@ -153,33 +189,42 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 
 	var wg sync.WaitGroup
 	var denseDocs, sparseDocs []model.EsDocument
-	var denseErr, sparseErr error
+	var sparseErr error
 
-	// 4.1 向量检索 (Dense Retrieval)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		log.Infof("[SearchService] 开始向量检索 (Dense Retrieval)")
-		queryBody := map[string]interface{}{
-			"knn": map[string]interface{}{
-				"field":          "vector",
-				"query_vector":   queryVector,
-				"k":              recallSize,
-				"num_candidates": 100,
-				"filter":         boolFilter,
-			},
-			"_source": []string{"file_md5", "chunk_id", "text_content", "user_id", "org_tag", "is_public", "vector_id"},
-			"size":    recallSize,
-		}
-		denseDocs, denseErr = s.executeEsQuery(ctx, queryBody)
-		if denseErr != nil {
-			log.Errorf("[SearchService] 向量检索失败: %v", denseErr)
-		} else {
-			log.Infof("[SearchService] 向量检索召回 %d 条文档", len(denseDocs))
-		}
-	}()
+	// 5.1 多路向量检索 (Dense Retrieval) - 每个查询向量独立检索
+	var allDenseDocs []model.EsDocument
+	var denseErrors []error
+	var denseMu sync.Mutex
 
-	// 4.2 关键词检索 (Sparse Retrieval)
+	for _, qv := range queryVectors {
+		wg.Add(1)
+		go func(vector []float32) {
+			defer wg.Done()
+			queryBody := map[string]interface{}{
+				"knn": map[string]interface{}{
+					"field":          "vector",
+					"query_vector":   vector,
+					"k":              recallSize,
+					"num_candidates": 100,
+					"filter":         boolFilter,
+				},
+				"_source": []string{"file_md5", "chunk_id", "text_content", "user_id", "org_tag", "is_public", "vector_id"},
+				"size":    recallSize,
+			}
+			docs, err := s.executeEsQuery(ctx, queryBody)
+			denseMu.Lock()
+			defer denseMu.Unlock()
+			if err != nil {
+				log.Errorf("[SearchService] 向量检索失败: %v", err)
+				denseErrors = append(denseErrors, err)
+			} else {
+				log.Infof("[SearchService] 向量检索召回 %d 条文档", len(docs))
+				allDenseDocs = append(allDenseDocs, docs...)
+			}
+		}(qv)
+	}
+
+	// 5.2 关键词检索 (Sparse Retrieval)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -245,8 +290,12 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 
 	wg.Wait()
 
-	// 5. RRF 融合 (Reciprocal Rank Fusion)
-	log.Info("[SearchService] 步骤5: 执行 RRF 融合")
+	// 合并多路向量检索结果并去重
+	denseDocs = deduplicateDocs(allDenseDocs)
+	log.Infof("[SearchService] 多路向量检索去重后共 %d 条文档", len(denseDocs))
+
+	// 6. RRF 融合 (Reciprocal Rank Fusion)
+	log.Info("[SearchService] 步骤6: 执行 RRF 融合")
 	var resultLists [][]interface{}
 
 	if len(denseDocs) > 0 {
@@ -695,4 +744,72 @@ func generateCacheKey(keywords *KeywordExtractionResult) string {
 
 	// 生成指纹：前缀 + 关键词序列（用 | 分隔）
 	return "search_cache:" + strings.Join(normalizedKeys, "|")
+}
+
+// rewriteQueries 使用 LLM 将用户查询重写为多个变体，以提升向量检索的召回率。
+func (s *searchService) rewriteQueries(ctx context.Context, query string) ([]string, error) {
+	if s.llmClient == nil {
+		return nil, nil
+	}
+
+	prompt := fmt.Sprintf(`你是一个查询重写专家。请将用户的问题改写为 2-3 个不同表述但语义相同的查询，用于提升搜索召回率。
+
+要求：
+1. 每个改写应使用不同的表达方式（同义词替换、角度转换、抽象/具体化）
+2. 保持与原问题相同的核心语义
+3. 不要添加原问题中没有的信息
+
+用户问题："%s"
+
+请严格按照以下 JSON 格式返回，不要包含任何其他文字：
+{"queries": ["改写1", "改写2", "改写3"]}`, query)
+
+	messages := []llm.Message{
+		{Role: "user", Content: prompt},
+	}
+
+	response, err := s.llmClient.GenerateOneShot(ctx, messages)
+	if err != nil {
+		return nil, fmt.Errorf("LLM query rewrite failed: %w", err)
+	}
+
+	// 解析 JSON 响应
+	var result struct {
+		Queries []string `json:"queries"`
+	}
+
+	jsonStart := strings.Index(response, "{")
+	jsonEnd := strings.LastIndex(response, "}")
+	if jsonStart == -1 || jsonEnd == -1 {
+		return nil, fmt.Errorf("invalid LLM response format for query rewrite")
+	}
+
+	jsonStr := response[jsonStart : jsonEnd+1]
+	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+		return nil, fmt.Errorf("failed to parse query rewrite JSON: %w", err)
+	}
+
+	// 过滤空查询和与原查询完全相同的结果
+	var rewritten []string
+	for _, q := range result.Queries {
+		q = strings.TrimSpace(q)
+		if q != "" && q != query {
+			rewritten = append(rewritten, q)
+		}
+	}
+
+	return rewritten, nil
+}
+
+// deduplicateDocs 根据 VectorID 对文档进行去重。
+func deduplicateDocs(docs []model.EsDocument) []model.EsDocument {
+	seen := make(map[string]bool)
+	var unique []model.EsDocument
+	for _, doc := range docs {
+		if !seen[doc.VectorID] {
+			seen[doc.VectorID] = true
+			unique = append(unique, doc)
+		}
+	}
+	return unique
 }

@@ -73,8 +73,6 @@ func main() {
 	adminService := service.NewAdminService(orgTagRepo, userRepository, conversationRepo)
 	uploadService := service.NewUploadService(uploadRepo, userRepository, cfg.MinIO)
 	documentService := service.NewDocumentService(uploadRepo, userRepository, orgTagRepo, cfg.MinIO, tikaClient)
-	cacheService := service.NewContentCacheService() // Initialize CacheService
-
 	// 初始化 Redis 客户端（用于检索结果缓存）
 	redisClient := redis.NewClient(&redis.Options{
 		Addr:     cfg.Database.Redis.Addr,
@@ -82,9 +80,15 @@ func main() {
 		DB:       cfg.Database.Redis.DB,
 	})
 
+	// 初始化语义缓存服务（注入 Redis + Embedding 客户端）
+	cacheService := service.NewContentCacheService(
+		service.WithRedisClient(redisClient),
+		service.WithEmbeddingClient(embeddingClient),
+	)
+
 	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo, rerankClient, llmClient, cfg.Segmenter, redisClient) // 注入 Redis Client
 	conversationService := service.NewConversationService(conversationRepo)
-	chatService := service.NewChatService(searchService, llmClient, conversationRepo, cacheService)
+	chatService := service.NewChatService(searchService, llmClient, conversationRepo, cacheService, embeddingClient)
 
 	// 6. 初始化文件处理管道 (Processor)
 	processor := pipeline.NewProcessor(
