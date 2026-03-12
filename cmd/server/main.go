@@ -178,6 +178,7 @@ func main() {
 		chatGroup := apiV1.Group("/chat")
 		{
 			chatGroup.GET("/websocket-token", handler.NewChatHandler(chatService, userService, jwtManager).GetWebsocketStopToken)
+			chatGroup.GET("/tools", handler.NewChatHandler(chatService, userService, jwtManager).ListTools)
 		}
 		r.GET("/chat/:token", handler.NewChatHandler(chatService, userService, jwtManager).Handle)
 

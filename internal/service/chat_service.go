@@ -13,17 +13,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 	"github.com/gorilla/websocket"
 
 	"pai-smart-go/internal/agent/graph"
 	"pai-smart-go/internal/agent/state"
 	"pai-smart-go/internal/agent/tools"
+	"pai-smart-go/internal/agent/tools/generated"
 )
 
 // ChatService 定义了聊天操作的接口。
 type ChatService interface {
 	StreamResponse(ctx context.Context, query string, user *model.User, ws *websocket.Conn, shouldStop func() bool) error
+	GetTools(ctx context.Context) ([]model.ToolDTO, error)
 }
 
 type chatService struct {
@@ -55,6 +58,14 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 	// 拦截 websocket writer 以捕获完整答案，并包装为 JSON 分块
 	answerBuilder := &strings.Builder{}
 	interceptor := &wsWriterInterceptor{conn: ws, writer: answerBuilder, shouldStop: shouldStop}
+
+	handled, err := s.tryHandleToolGeneration(ctx, query, user, history, interceptor)
+	if err != nil {
+		return err
+	}
+	if handled {
+		return nil
+	}
 
 	// Cache Check 提前拦截（相当于短路）
 	if cachedAnswer, hit := s.cacheService.Get(ctx, query, history); hit {
@@ -92,28 +103,31 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 	ctx = WithUserContext(ctx, user)
 
 	// 初始化各 Tool (建议在 Service 初始化时完成，避免每个请求都新建)
+	var allTools []tool.InvokableTool
+
 	retrieverTool := s.searchService.AsEinoRetriever()
 	searchTool, err := tools.NewSearchTool(retrieverTool)
-	if err != nil {
-		return fmt.Errorf("failed to create search tool: %v", err)
+	if err == nil {
+		allTools = append(allTools, searchTool)
 	}
 
 	weatherTool, err := tools.NewWeatherTool()
-	if err != nil {
-		return fmt.Errorf("failed to create weather tool: %v", err)
+	if err == nil {
+		allTools = append(allTools, weatherTool)
 	}
 
 	webSearchTool, err := tools.NewWebSearchTool()
-	if err != nil {
-		return fmt.Errorf("failed to create web search tool: %v", err)
+	if err == nil {
+		allTools = append(allTools, webSearchTool)
 	}
+
+	// 加入动态生成的 tools
+	allTools = append(allTools, generated.GetGeneratedTools()...)
 
 	// 编译并初始化 Workflow
 	workflow, err := graph.CompileAgentGraph(ctx, &graph.AgentConfig{
-		LLMClient:     s.llmClient,
-		SearchTool:    searchTool,
-		WeatherTool:   weatherTool,
-		WebSearchTool: webSearchTool,
+		LLMClient: s.llmClient,
+		Tools:     allTools,
 	}, func(chunk string) {
 		interceptor.WriteMessage(websocket.TextMessage, []byte(chunk))
 	})
@@ -143,6 +157,56 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 	}
 
 	return nil
+}
+
+// GetTools 返回当前所有可用的工具列表。
+func (s *chatService) GetTools(ctx context.Context) ([]model.ToolDTO, error) {
+	var results []model.ToolDTO
+
+	// 1. 获取内置工具
+	retrieverTool := s.searchService.AsEinoRetriever()
+	searchTool, _ := tools.NewSearchTool(retrieverTool)
+	if searchTool != nil {
+		info, _ := searchTool.Info(ctx)
+		results = append(results, model.ToolDTO{
+			Name:        info.Name,
+			Description: info.Desc,
+			IsGenerated: false,
+		})
+	}
+
+	weatherTool, _ := tools.NewWeatherTool()
+	if weatherTool != nil {
+		info, _ := weatherTool.Info(ctx)
+		results = append(results, model.ToolDTO{
+			Name:        info.Name,
+			Description: info.Desc,
+			IsGenerated: false,
+		})
+	}
+
+	webSearchTool, _ := tools.NewWebSearchTool()
+	if webSearchTool != nil {
+		info, _ := webSearchTool.Info(ctx)
+		results = append(results, model.ToolDTO{
+			Name:        info.Name,
+			Description: info.Desc,
+			IsGenerated: false,
+		})
+	}
+
+	// 2. 获取动态生成的工具
+	genTools := generated.GetGeneratedTools()
+	for _, gt := range genTools {
+		info, _ := gt.Info(ctx)
+		results = append(results, model.ToolDTO{
+			Name:        info.Name,
+			Description: info.Desc,
+			IsGenerated: true,
+		})
+	}
+
+	return results, nil
 }
 
 // buildPrompt 根据用户输入和搜索结果构建prompt

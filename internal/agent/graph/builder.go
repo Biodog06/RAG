@@ -16,10 +16,8 @@ import (
 
 // AgentConfig 包含了初始化智能体图层所需的依赖配置
 type AgentConfig struct {
-	LLMClient     llm.Client
-	SearchTool    tool.InvokableTool
-	WeatherTool   tool.InvokableTool
-	WebSearchTool tool.InvokableTool
+	LLMClient llm.Client
+	Tools     []tool.InvokableTool
 }
 
 // InterceptorHandler 定义了外部传入处理消息流块的回调
@@ -28,8 +26,20 @@ type InterceptorHandler func(chunk string)
 // CompileAgentGraph 构建并编译 Eino Agent 的连通运行图 (Workflow)
 func CompileAgentGraph(ctx context.Context, config *AgentConfig, streamHandler InterceptorHandler) (compose.Runnable[*state.RagState, *state.RagState], error) {
 	// 1. 构造 ToolsNode
+	baseTools := make([]tool.BaseTool, 0, len(config.Tools))
+	toolInfos := make([]*schema.ToolInfo, 0, len(config.Tools))
+
+	for _, t := range config.Tools {
+		baseTools = append(baseTools, t)
+		info, err := t.Info(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get tool info: %v", err)
+		}
+		toolInfos = append(toolInfos, info)
+	}
+
 	toolsNode, err := compose.NewToolNode(ctx, &compose.ToolsNodeConfig{
-		Tools: []tool.BaseTool{config.SearchTool, config.WeatherTool, config.WebSearchTool},
+		Tools: baseTools,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create tools node: %v", err)
@@ -41,11 +51,8 @@ func CompileAgentGraph(ctx context.Context, config *AgentConfig, streamHandler I
 	// Chat 核心推理节点
 	graph.AddLambdaNode("chat_node", compose.InvokableLambda(func(ctx context.Context, ragState *state.RagState) (*state.RagState, error) {
 		einoModel := config.LLMClient.AsEinoChatModel()
-		searchToolInfo, _ := config.SearchTool.Info(ctx)
-		weatherToolInfo, _ := config.WeatherTool.Info(ctx)
-		webSearchToolInfo, _ := config.WebSearchTool.Info(ctx)
 
-		streamReader, err := einoModel.Stream(ctx, ragState.Messages, einomodel.WithTools([]*schema.ToolInfo{searchToolInfo, weatherToolInfo, webSearchToolInfo}))
+		streamReader, err := einoModel.Stream(ctx, ragState.Messages, einomodel.WithTools(toolInfos))
 		if err != nil {
 			return nil, fmt.Errorf("llm stream failed: %w", err)
 		}

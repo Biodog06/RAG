@@ -49,8 +49,17 @@ func (h *ChatHandler) GetWebsocketStopToken(c *gin.Context) {
 	defer h.stopTokenLock.Unlock()
 	// 在真实的多服务器设置中，这应该在 Redis 中生成和存储
 	// 为简单起见，我们在这里使用一个单一的、轮换的令牌。
-	h.stopToken = "WSS_STOP_CMD_" + token.GenerateRandomString(16)
 	c.JSON(http.StatusOK, gin.H{"code": http.StatusOK, "message": "success", "data": gin.H{"cmdToken": h.stopToken}})
+}
+
+// ListTools 返回当前可用的所有工具。
+func (h *ChatHandler) ListTools(c *gin.Context) {
+	results, err := h.chatService.GetTools(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": http.StatusInternalServerError, "message": "获取工具列表失败", "data": nil})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": http.StatusOK, "message": "success", "data": results})
 }
 
 // Handle 处理一个传入的 WebSocket 连接。
