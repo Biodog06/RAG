@@ -27,6 +27,8 @@ type Client interface {
 	StreamChatMessages(ctx context.Context, messages []Message, gen *GenerationParams, writer MessageWriter) error
 	// 为兼容旧调用，保留 StreamChat：由内部包装为 messages 调用。
 	StreamChat(ctx context.Context, prompt string, writer MessageWriter) error
+	// GenerateOneShot 执行非流式的一次性文本生成。
+	GenerateOneShot(ctx context.Context, messages []Message) (string, error)
 }
 
 type deepseekClient struct {
@@ -62,6 +64,14 @@ type chatResponse struct {
 		Delta struct {
 			Content string `json:"content"`
 		} `json:"delta"`
+	} `json:"choices"`
+}
+
+type nonStreamChatResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
 	} `json:"choices"`
 }
 
@@ -160,4 +170,61 @@ func (c *deepseekClient) StreamChatMessages(ctx context.Context, messages []Mess
 		}
 	}
 	return nil
+}
+
+func (c *deepseekClient) GenerateOneShot(ctx context.Context, messages []Message) (string, error) {
+	reqBody := chatRequest{
+		Model:    c.cfg.Model,
+		Messages: messages,
+		Stream:   false,
+	}
+
+	// 注入生成参数（从全局配置）
+	if c.cfg.Generation.Temperature != 0 {
+		t := c.cfg.Generation.Temperature
+		reqBody.Temperature = &t
+	}
+	if c.cfg.Generation.TopP != 0 {
+		p := c.cfg.Generation.TopP
+		reqBody.TopP = &p
+	}
+	if c.cfg.Generation.MaxTokens != 0 {
+		m := c.cfg.Generation.MaxTokens
+		reqBody.MaxTokens = &m
+	}
+
+	reqBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal chat request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.cfg.BaseURL+"/chat/completions", bytes.NewReader(reqBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create chat request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to call chat api: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("chat api returned non-200 status: %s, body: %s", resp.Status, string(bodyBytes))
+	}
+
+	var result nonStreamChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("failed to decode chat response: %w", err)
+	}
+
+	if len(result.Choices) > 0 {
+		return result.Choices[0].Message.Content, nil
+	}
+
+	return "", fmt.Errorf("empty choices in chat response")
 }
