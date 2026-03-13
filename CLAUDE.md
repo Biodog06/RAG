@@ -168,6 +168,14 @@ Key settings beyond standard ones:
 | `embedding.dimensions` | Must match model (default: 2048 for text-embedding-v4) |
 | `llm.prompt.*` | System prompt rules, reference delimiters, no-result text |
 
+## Testing Requirements
+
+- **Mandatory Coverage**: All new features and bug fixes MUST include corresponding unit tests.
+- **Modified Code**: Any modification to existing code should update or add tests to maintain coverage.
+- **Go Tests**: Use `go test -v ./...` for backend verification.
+- **Frontend Tests**: Use `pnpm run typecheck` and ensure builds pass.
+- **Evidence**: Test results should be included in PR descriptions.
+
 ## Key Gotchas
 
 1. **ES index mapping:** Must be created with proper vector field mapping before first use. See `pkg/es/client.go`.
