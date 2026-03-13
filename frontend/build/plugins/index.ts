@@ -12,7 +12,7 @@ export function setupVitePlugins(viteEnv: Env.ImportMeta, buildTime: string) {
   const plugins: PluginOption = [
     vue(),
     vueJsx(),
-    setupDevtoolsPlugin(viteEnv),
+    // setupDevtoolsPlugin(viteEnv),
     setupElegantRouter(),
     setupUnocss(viteEnv),
     ...setupUnplugin(viteEnv),

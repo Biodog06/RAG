@@ -51,16 +51,16 @@ embedding:
 # Rerank model config
 rerank:
   enable: true
-  model: "bge-reranker-v2-m3" # 示例模型名
-  api_key: "sk-xxxxxx" # 请替换为您的 Key
-  base_url: "https://api.siliconflow.cn/v1/rerank" # 示例地址（如硅基流动/Jina）
+  model: "qwen3-vl-rerank" # 示例模型名
+  api_key: "" # 请替换为您的 Key
+  base_url: "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank" # 示例地址（如硅基流动/Jina）
   min_score: 0.3 # 低于此分数的会被过滤掉
 
 # LLM config
 llm:
   base_url: "https://api.deepseek.com/v1"  # 本地是 http://localhost:11434/v1 官方：https://api.deepseek.com/v1
   model: deepseek-chat  # 本地: deepseek-r1:7b, 官方: deepseek-chat
-  api_key: "sk-7d18e7cc656041e18062e8ce86bf0d7c"
+  api_key: ""
   prompt:
     rules: |
       你是派聪明知识助手，须遵守：

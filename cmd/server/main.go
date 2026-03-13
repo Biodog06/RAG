@@ -112,8 +112,12 @@ func main() {
 	// 8. 设置 Gin 模式并创建路由引擎
 	gin.SetMode(cfg.Server.Mode)
 	r := gin.New() // 使用 New() 创建一个不带默认中间件的引擎
-	// 添加我们自定义的日志中间件和 Gin 的 Recovery 中间件
-	r.Use(middleware.RequestLogger(), gin.Recovery())
+
+	// 初始化限流器 (例如：每秒 10 个请求，桶大小 20)
+	limiter := middleware.NewRateLimiter(10, 20)
+
+	// 添加中间件：日志、恢复、限流
+	r.Use(middleware.RequestLogger(), gin.Recovery(), limiter.Handler())
 
 	// 9. 注册路由
 	apiV1 := r.Group("/api/v1")
@@ -157,11 +161,13 @@ func main() {
 		documents := apiV1.Group("/documents")
 		documents.Use(middleware.AuthMiddleware(jwtManager, userService))
 		{
-			documents.GET("/accessible", handler.NewDocumentHandler(documentService, userService).ListAccessibleFiles)
-			documents.GET("/uploads", handler.NewDocumentHandler(documentService, userService).ListUploadedFiles)
-			documents.DELETE("/:fileMd5", handler.NewDocumentHandler(documentService, userService).DeleteDocument)
-			documents.GET("/download", handler.NewDocumentHandler(documentService, userService).GenerateDownloadURL) // Path param -> Query param
-			documents.GET("/preview", handler.NewDocumentHandler(documentService, userService).PreviewFile)
+			documentHandler := handler.NewDocumentHandler(documentService, userService)
+			documents.GET("/accessible", documentHandler.ListAccessibleFiles)
+			documents.GET("/uploads", documentHandler.ListUploadedFiles)
+			documents.DELETE("/:fileMd5", documentHandler.DeleteDocument)
+			documents.GET("/download", documentHandler.GenerateDownloadURL) // Path param -> Query param
+			documents.GET("/preview", documentHandler.PreviewFile)
+			documents.GET("/browser-preview", documentHandler.BrowserPreview) // 新增浏览器预览
 		}
 
 		// Search 路由组

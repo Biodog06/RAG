@@ -46,7 +46,7 @@ func (h *SearchHandler) HybridSearch(c *gin.Context) {
 		return
 	}
 
-	results, err := h.searchService.HybridSearch(c.Request.Context(), query, topK, user.(*model.User))
+	results, err := h.searchService.HybridSearch(c.Request.Context(), query, topK, user.(*model.User), nil)
 	if err != nil {
 		log.Errorf("[SearchHandler] 混合搜索服务返回错误, error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "搜索失败"})

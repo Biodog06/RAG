@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { NScrollbar } from 'naive-ui';
+import { NModal, NScrollbar } from 'naive-ui';
 import { VueMarkdownItProvider } from 'vue-markdown-shiki';
+import FilePreview from '@/components/custom/file-preview.vue';
 import ChatMessage from './chat-message.vue';
 
 defineOptions({
@@ -8,7 +9,7 @@ defineOptions({
 });
 
 const chatStore = useChatStore();
-const { list } = storeToRefs(chatStore);
+const { list, previewVisible, previewFileName } = storeToRefs(chatStore);
 
 const loading = ref(false);
 const scrollbarRef = ref<InstanceType<typeof NScrollbar>>();
@@ -33,9 +34,9 @@ const params = computed(() => {
   };
 });
 
-watchEffect(() => {
+watch(params, () => {
   getList();
-});
+}, { immediate: true });
 
 async function getList() {
   loading.value = true;
@@ -55,8 +56,8 @@ onMounted(() => {
 </script>
 
 <template>
-  <Suspense>
-    <NScrollbar ref="scrollbarRef" class="h-0 flex-auto">
+  <div class="flex-1 flex-col h-full overflow-hidden">
+    <NScrollbar ref="scrollbarRef" class="flex-1">
       <Teleport defer to="#header-extra">
         <div class="px-10">
           <NForm :model="params" label-placement="left" :show-feedback="false" inline>
@@ -72,7 +73,15 @@ onMounted(() => {
         </VueMarkdownItProvider>
       </NSpin>
     </NScrollbar>
-  </Suspense>
+    <!-- 文件预览弹窗 -->
+    <NModal v-model:show="previewVisible" preset="card" title="文件预览" style="width: 80%; max-width: 1000px;">
+      <FilePreview
+        :file-name="previewFileName"
+        :visible="previewVisible"
+        @close="previewVisible = false"
+      />
+    </NModal>
+  </div>
 </template>
 
 <style scoped lang="scss"></style>

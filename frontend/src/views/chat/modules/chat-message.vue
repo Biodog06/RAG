@@ -16,37 +16,17 @@ function handleCopy(content: string) {
 
 const chatStore = useChatStore();
 
-// 存储文件名和对应的事件处理
-const sourceFiles = ref<Array<{fileName: string, id: string}>>([]);
-
-// 处理来源文件链接的函数
-function processSourceLinks(text: string): string {
-  // 匹配 (来源#数字: 文件名) 的正则表达式
-  const sourcePattern = /\(来源#(\d+):\s*([^)]+)\)/g;
-
-  return text.replace(sourcePattern, (_match, sourceNum, fileName) => {
-    // 为文件名创建可点击的链接
-    const linkClass = 'source-file-link';
-    const encodedFileName = encodeURIComponent(fileName.trim());
-    const fileId = `source-file-${sourceFiles.value.length}`;
-
-    // 存储文件信息
-    sourceFiles.value.push({
-      fileName: encodedFileName,
-      id: fileId
-    });
-
-    return `(来源#${sourceNum}: <span class="${linkClass}" data-file-id="${fileId}">${fileName}</span>)`;
-  });
-}
-
 const content = computed(() => {
-  chatStore.scrollToBottom?.();
   const rawContent = props.msg.content ?? '';
 
   // 只对助手消息处理来源链接
   if (props.msg.role === 'assistant') {
-    return processSourceLinks(rawContent);
+    const sourcePattern = /\(来源#(\d+):\s*([^)]+)\)/g;
+    return rawContent.replace(sourcePattern, (_match, sourceNum, fileName) => {
+      const linkClass = 'source-file-link';
+      const encodedFileName = encodeURIComponent(fileName.trim());
+      return `(来源#${sourceNum}: <span class="${linkClass}" data-file-name="${encodedFileName}">${fileName}</span>)`;
+    });
   }
 
   return rawContent;
@@ -58,56 +38,21 @@ function handleContentClick(event: MouseEvent) {
 
   // 检查点击的是否是文件链接
   if (target.classList.contains('source-file-link')) {
-    const fileId = target.getAttribute('data-file-id');
-    if (fileId) {
-      const file = sourceFiles.value.find(f => f.id === fileId);
-      if (file) {
-        handleSourceFileClick(file.fileName);
-      }
+    const fileName = target.getAttribute('data-file-name');
+    if (fileName) {
+      handleSourceFileClick(fileName);
     }
   }
 }
 
 // 处理来源文件点击事件
-async function handleSourceFileClick(fileName: string) {
+function handleSourceFileClick(fileName: string) {
   const decodedFileName = decodeURIComponent(fileName);
   console.log('点击了来源文件:', decodedFileName);
 
-  try {
-    window.$message?.loading(`正在获取文件下载链接: ${decodedFileName}`, {
-      duration: 0,
-      closable: false
-    });
-
-    // 调用文件下载接口
-    const { error, data } = await request<Api.Document.DownloadResponse>({
-      url: 'documents/download',
-      params: {
-        fileName: decodedFileName,
-        token: authStore.token
-      },
-      baseURL: '/proxy-api'
-    });
-
-    window.$message?.destroyAll();
-
-    if (error) {
-      window.$message?.error(`文件下载失败: ${error.response?.data?.message || '未知错误'}`);
-      return;
-    }
-
-    if (data?.downloadUrl) {
-      // 在新窗口打开下载链接
-      window.open(data.downloadUrl, '_blank');
-      window.$message?.success(`文件下载链接已打开: ${decodedFileName}`);
-    } else {
-      window.$message?.error('未能获取到下载链接');
-    }
-  } catch (err) {
-    window.$message?.destroyAll();
-    console.error('文件下载失败:', err);
-    window.$message?.error(`文件下载失败: ${decodedFileName}`);
-  }
+  // 使用 store 中的预览状态，触发 ChatList 中的弹窗
+  chatStore.previewFileName = decodedFileName;
+  chatStore.previewVisible = true;
 }
 </script>
 

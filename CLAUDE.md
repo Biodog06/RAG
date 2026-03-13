@@ -81,10 +81,10 @@ docker-compose logs -f [service_name]
 **Processing (`pipeline.Processor` consumes Kafka):**
 1. Download file from MinIO (`merged/<filename>`)
 2. Extract text via Apache Tika
-3. Split text into chunks: **1000 chars, 100 overlap** (using `[]rune` for Unicode safety)
-4. Save chunks to MySQL `document_vector` table (idempotent: deletes old records first)
-5. Generate embeddings via DashScope (OpenAI-compatible protocol)
-6. Index to Elasticsearch with vector field
+3. Split text into chunks: **自适应策略** (Markdown 1500, Code 1200, Default 1000)
+4. Save chunks to MySQL `document_vector` table (idempotent)
+5. Generate embeddings via DashScope: **批量向量化** (10个/批次), **并发处理** (5个并发Worker)
+6. Index to Elasticsearch: **部分失败容错** (异常分块跳过不阻塞全文件)
 
 **Alternative splitter:** `pkg/splitter/markdown.go` — header-aware Markdown splitting that preserves section hierarchy context (not used in default pipeline, available for custom use).
 
@@ -93,15 +93,21 @@ docker-compose logs -f [service_name]
 7-step pipeline for each query:
 
 1. **Resolve org tags** — get user's effective org tags including hierarchy
-2. **Keyword extraction** — LLM extracts core/optional keywords (3-tier fallback: LLM → `gse` segmenter → simple split)
-3. **Cache check** — Redis lookup by normalized core keywords (`search_cache:<kw1>|<kw2>` key, 24h TTL)
-4. **Vectorize** — embed raw query via DashScope
-5. **Parallel retrieval** — concurrent vector (KNN) + keyword (BM25) search in ES, each recalling 60 docs
+2. **Keyword extraction** — LLM extracts core/optional keywords (3-tier fallback)
+3. **Cache check** — Redis lookup by normalized core keywords
+4. **Vectorize** — embed raw query
+5. **Parallel retrieval** — ES 向量检索 (KNN) + 关键词检索 (BM25), **禁用 track_total_hits 优化性能**
 6. **RRF fusion** — Reciprocal Rank Fusion (k=60) merges both recall lists
-7. **Rerank** — top-50 candidates sent to rerank model (falls back to RRF order if disabled/fails)
-8. **Return top-K** — fetch filenames from MySQL, async write cache
+7. **Rerank** — top-50 candidates sent to rerank model
+8. **Return top-K** — fetch filenames, **异步写入动态 TTL 缓存** (基于频率: 1h - 7d)
 
-ES index name is hardcoded as `knowledge_base` in `executeEsQuery`.
+### Security & Observability
+
+- **Rate Limiting:** 全局限流中间件 (10 QPS/用户)，防止 API 滥用
+- **Log Masking:** 自动脱敏日志中的 token, password, secret 等敏感词
+- **Slow Query Log:** 自动记录耗时超过 2s 的慢搜索请求
+- **Retry Mechanism:** ES 交互自动重试 (502/503/504)，Kafka 任务 3 次失败进入逻辑死信状态
+- **Connection Pooling:** 优化了 HTTP 与 Elasticsearch 的连接池配置
 
 ### Chat Flow (`internal/service/chat_service.go`)
 

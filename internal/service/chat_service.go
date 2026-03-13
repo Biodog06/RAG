@@ -66,20 +66,22 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 		}
 	}
 
-	// 1. 使用 SearchService 检索上下文（提升覆盖度：topK=10）
-	results, err := s.searchService.HybridSearch(ctx, query, 10, user)
-	if err != nil {
-		return fmt.Errorf("failed to retrieve context: %w", err)
-	}
-
-	// 2. 构建上下文与 system 消息、历史
-	contextText := s.buildContextText(results)
-	systemMsg := s.buildSystemMessage(contextText)
+	// 1. 加载对话历史（用于后续的查询重写与指代消解）
 	history, err := s.loadHistory(ctx, user.ID)
 	if err != nil {
 		log.Errorf("Failed to load conversation history: %v", err)
 		history = []model.ChatMessage{}
 	}
+
+	// 2. 使用 SearchService 检索上下文（传入 history 以支持高级重写）
+	results, err := s.searchService.HybridSearch(ctx, query, 10, user, history)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve context: %w", err)
+	}
+
+	// 3. 构建上下文与 system 消息
+	contextText := s.buildContextText(results)
+	systemMsg := s.buildSystemMessage(contextText)
 	messages := s.composeMessages(systemMsg, history, query)
 
 	// 拦截 websocket writer 以捕获完整答案，并包装为 JSON 分块

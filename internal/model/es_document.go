@@ -18,6 +18,7 @@ type SearchResponseDTO struct {
 type EsDocument struct {
 	VectorID     string    `json:"vector_id"` // 唯一标识，例如 fileMd5 + chunkId
 	FileMD5      string    `json:"file_md5"`
+	FileName     string    `json:"file_name"` // 新增：保存文件名到 ES
 	ChunkID      int       `json:"chunk_id"`
 	TextContent  string    `json:"text_content"`
 	Vector       []float32 `json:"vector"` // 文本内容的向量表示

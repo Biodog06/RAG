@@ -9,6 +9,7 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"net/url"
 )
 
 // MinioClient 是一个全局的 MinIO 客户端实例。
@@ -50,11 +51,19 @@ func InitMinIO(cfg config.MinIOConfig) {
 }
 
 // GetPresignedURL generates a presigned URL for a given object.
-func GetPresignedURL(bucketName, objectName string, expiry time.Duration) (string, error) {
-	presignedURL, err := MinioClient.PresignedGetObject(context.Background(), bucketName, objectName, expiry, nil)
+func GetPresignedURL(bucketName, objectName string, expiry time.Duration, params url.Values) (string, error) {
+	presignedURL, err := MinioClient.PresignedGetObject(context.Background(), bucketName, objectName, expiry, params)
 	if err != nil {
 		log.Errorf("Error generating presigned URL: %s", err)
 		return "", err
 	}
 	return presignedURL.String(), nil
+}
+
+// GetBrowserViewURL generates a presigned URL with inline content-disposition for browser viewing.
+func GetBrowserViewURL(bucketName, objectName string, expiry time.Duration) (string, error) {
+	reqParams := make(url.Values)
+	// Suggest browser to open inline instead of download
+	reqParams.Set("response-content-disposition", "inline")
+	return GetPresignedURL(bucketName, objectName, expiry, reqParams)
 }

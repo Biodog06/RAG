@@ -106,10 +106,26 @@ func (h *DocumentHandler) GenerateDownloadURL(c *gin.Context) {
 		return
 	}
 
-	downloadInfo, err := h.docService.GenerateDownloadURL(fileName, user)
-	if err != nil {
-		log.Warnf("GenerateDownloadURL: failed for user %s, file %s, err: %v", user.Username, fileName, err)
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+	var downloadInfo *service.DownloadInfoDTO
+	var errSvc error
+
+	if c.Query("preview") == "true" {
+		previewURL, err := h.docService.GenerateBrowserPreviewURL(fileName, user)
+		if err != nil {
+			errSvc = err
+		} else {
+			downloadInfo = &service.DownloadInfoDTO{
+				FileName:    fileName,
+				DownloadURL: previewURL,
+			}
+		}
+	} else {
+		downloadInfo, errSvc = h.docService.GenerateDownloadURL(fileName, user)
+	}
+
+	if errSvc != nil {
+		log.Warnf("GenerateDownloadURL/Preview: failed for user %s, file %s, err: %v", user.Username, fileName, errSvc)
+		c.JSON(http.StatusNotFound, gin.H{"error": errSvc.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -144,6 +160,31 @@ func (h *DocumentHandler) PreviewFile(c *gin.Context) {
 		"message": "文件预览内容获取成功",
 		"data":    previewInfo,
 	})
+}
+
+// BrowserPreview 处理浏览器直接打开文件的预览请求。
+func (h *DocumentHandler) BrowserPreview(c *gin.Context) {
+	fileName := c.Query("fileName")
+	if fileName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少文件名"})
+		return
+	}
+
+	user, err := h.getUserFromContext(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "无法获取用户信息"})
+		return
+	}
+
+	previewURL, err := h.docService.GenerateBrowserPreviewURL(fileName, user)
+	if err != nil {
+		log.Warnf("BrowserPreview: failed for user %s, file %s, err: %v", user.Username, fileName, err)
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 直接重定向到预签名链接，方便浏览器直接打开
+	c.Redirect(http.StatusFound, previewURL)
 }
 
 // getUserFromContext 是一个辅助函数，用于从 Gin 上下文中获取完整的用户模型。

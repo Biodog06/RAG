@@ -4,3 +4,4 @@ frontend/packages/scripts/bin.ts
 frontend/packages/scripts/bin.ts
 /logs
 /vendor
+/configs/config.run.yaml

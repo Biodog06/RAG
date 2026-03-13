@@ -42,20 +42,21 @@ func NewClient(cfg config.RerankConfig) Client {
 	}
 }
 
-// 请求体结构 (兼容 BGE/Jina/Cohere 等常见 Rerank API 格式)
+// 请求体结构 (适配阿里 DashScope)
 type rerankRequest struct {
-	Model     string   `json:"model"`
-	Query     string   `json:"query"`
-	Documents []string `json:"documents"`
-	TopN      int      `json:"top_n,omitempty"`
+	Model string `json:"model"`
+	Input struct {
+		Query     string   `json:"query"`
+		Documents []string `json:"documents"`
+	} `json:"input"`
+	TopN int `json:"top_n,omitempty"`
 }
 
 // 响应体结构
 type rerankResponse struct {
-	Results []Result `json:"results"`
-	Usage   struct {
-		TotalTokens int `json:"total_tokens"`
-	} `json:"usage"`
+	Output struct {
+		Results []Result `json:"results"`
+	} `json:"output"`
 }
 
 func (c *httpClient) Rerank(ctx context.Context, query string, documents []string) ([]Result, error) {
@@ -75,11 +76,11 @@ func (c *httpClient) Rerank(ctx context.Context, query string, documents []strin
 	log.Infof("[RerankClient] 开始调用 Rerank API, model: %s, doc_count: %d", c.cfg.Model, len(documents))
 
 	reqBody := rerankRequest{
-		Model:     c.cfg.Model,
-		Query:     query,
-		Documents: documents,
-		TopN:      len(documents), // 获取所有文档的分数以便自行过滤
+		Model: c.cfg.Model,
+		TopN:  len(documents),
 	}
+	reqBody.Input.Query = query
+	reqBody.Input.Documents = documents
 
 	reqBytes, err := json.Marshal(reqBody)
 	if err != nil {
@@ -113,11 +114,12 @@ func (c *httpClient) Rerank(ctx context.Context, query string, documents []strin
 		return nil, fmt.Errorf("failed to decode rerank response: %w", err)
 	}
 
-	// 确保结果按分数降序排列 (虽然 API 通常已经排好，但双重保险)
-	sort.Slice(rerankResp.Results, func(i, j int) bool {
-		return rerankResp.Results[i].RelevanceScore > rerankResp.Results[j].RelevanceScore
+	results := rerankResp.Output.Results
+	// 确保结果按分数降序排列
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].RelevanceScore > results[j].RelevanceScore
 	})
 
-	log.Infof("[RerankClient] Rerank 完成, 返回 %d 个结果", len(rerankResp.Results))
-	return rerankResp.Results, nil
+	log.Infof("[RerankClient] Rerank 完成, 返回 %d 个结果", len(results))
+	return results, nil
 }

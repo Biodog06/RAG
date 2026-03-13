@@ -16,10 +16,20 @@ import (
 	"pai-smart-go/pkg/storage"
 	"pai-smart-go/pkg/tasks"
 	"pai-smart-go/pkg/tika"
+	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/minio/minio-go/v7"
+)
+
+const (
+	// embeddingBatchSize 每批向量化的分块数量，减少 API 调用次数
+	embeddingBatchSize = 10
+	// maxConcurrentWorkers 并发向量化的最大工作协程数
+	maxConcurrentWorkers = 5
 )
 
 // Processor 封装了文件处理的所有依赖和逻辑。
@@ -56,6 +66,7 @@ func NewProcessor(
 
 // Process 是文件处理的主函数。
 func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) error {
+	processStart := time.Now()
 	log.Infof("[Processor] 开始处理文件, FileMD5: %s, FileName: %s, UserID: %d", task.FileMD5, task.FileName, task.UserID)
 
 	// 1. 从 MinIO 下载文件
@@ -94,9 +105,11 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 	}
 	log.Infof("[Processor] 步骤2: 文本提取成功, 内容长度: %d 字符", utf8.RuneCountInString(textContent))
 
-	// 3. 文本切块
-	log.Info("[Processor] 步骤3: 进行文本分块, chunkSize: 1000, chunkOverlap: 100")
-	chunks := p.splitText(textContent, 1000, 100, task.FileName)
+	// 3. 自适应文本切块 —— 根据文件类型选择最优分块策略
+	chunkSize, chunkOverlap := p.selectChunkParams(task.FileName)
+	log.Infof("[Processor] 步骤3: 进行文本分块, chunkSize: %d, chunkOverlap: %d, strategy: %s",
+		chunkSize, chunkOverlap, p.describeChunkStrategy(task.FileName))
+	chunks := p.splitText(textContent, chunkSize, chunkOverlap, task.FileName)
 	log.Infof("[Processor] 步骤3: 文本分块完成, 共生成 %d 个分块", len(chunks))
 	if len(chunks) == 0 {
 		log.Warnf("[Processor] 未生成任何文本分块, 处理中止, FileName: %s", task.FileName)
@@ -109,12 +122,17 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 	if err := p.docVectorRepo.DeleteByFileMD5(task.FileMD5); err != nil {
 		log.Warnf("[Processor] 清理 document_vectors 旧记录失败 (file_md5=%s): %v", task.FileMD5, err)
 	}
+	// 新增：同步清理 ES 中的旧分块
+	if err := es.DeleteByFileMD5(ctx, p.esCfg.IndexName, task.FileMD5); err != nil {
+		log.Warnf("[Processor] 清理 Elasticsearch 旧记录失败 (file_md5=%s): %v", task.FileMD5, err)
+	}
 	dbVectors := make([]*model.DocumentVector, 0, len(chunks))
 	for i, chunk := range chunks {
 		dbVectors = append(dbVectors, &model.DocumentVector{
 			FileMD5:     task.FileMD5,
 			ChunkID:     i,
 			TextContent: chunk,
+			FileName:    task.FileName, // 新增：保存文件名到 DB
 			UserID:      task.UserID,
 			OrgTag:      task.OrgTag,
 			IsPublic:    task.IsPublic,
@@ -126,8 +144,8 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 	}
 	log.Infof("[Processor] 阶段一: 成功将 %d 个分块存入数据库", len(dbVectors))
 
-	// 阶段二：从数据库读取，进行向量化，然后索引到ES
-	log.Info("[Processor] 阶段二: 开始从数据库读取分块并进行向量化")
+	// 阶段二：从数据库读取，进行批量向量化，然后索引到ES
+	log.Info("[Processor] 阶段二: 开始从数据库读取分块并进行批量向量化")
 	savedVectors, err := p.docVectorRepo.FindByFileMD5(task.FileMD5)
 	if err != nil {
 		log.Errorf("[Processor] 阶段二: 从数据库读取分块失败, FileMD5: %s, Error: %v", task.FileMD5, err)
@@ -135,48 +153,141 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 	}
 	log.Infof("[Processor] 阶段二: 成功从数据库读取 %d 个分块", len(savedVectors))
 
-	// 4. 向量化并索引到 ES
-	log.Info("[Processor] 步骤4: 开始遍历分块并进行向量化与索引")
-	for i, docVector := range savedVectors {
-		log.Infof("[Processor] 正在处理分块 %d/%d, ChunkID: %d", i+1, len(savedVectors), docVector.ChunkID)
-		// 4a. 向量化
-		vector, err := p.embeddingClient.CreateEmbedding(ctx, docVector.TextContent)
-		if err != nil {
-			log.Errorf("[Processor] 分块 %d 向量化失败, Error: %v", docVector.ChunkID, err)
-			return fmt.Errorf("块 %d 向量化失败: %w", docVector.ChunkID, err)
-		}
+	// 4. 批量向量化并索引到 ES（带并发控制和部分失败容错）
+	log.Info("[Processor] 步骤4: 开始批量向量化与索引")
+	failedChunks := p.batchEmbedAndIndex(ctx, savedVectors)
 
-		// 4b. 准备 ES 的 EsDocument 对象
-		esDoc := model.EsDocument{
-			VectorID:     fmt.Sprintf("%s_%d", docVector.FileMD5, docVector.ChunkID),
-			FileMD5:      docVector.FileMD5,
-			ChunkID:      docVector.ChunkID,
-			TextContent:  docVector.TextContent,
-			Vector:       vector,
-			ModelVersion: p.embeddingCfg.Model,
-			UserID:       docVector.UserID,
-			OrgTag:       docVector.OrgTag,
-			IsPublic:     docVector.IsPublic,
-		}
-		log.Infof("[Processor] 准备索引到ES的文档 (ChunkID: %d): %+v", esDoc.ChunkID, esDoc)
-
-		// 4c. 索引到 Elasticsearch
-		if err := es.IndexDocument(ctx, p.esCfg.IndexName, esDoc); err != nil {
-			log.Errorf("[Processor] 索引分块 %d 到Elasticsearch失败, Error: %v", docVector.ChunkID, err)
-			return fmt.Errorf("索引块 %d 到 Elasticsearch 失败: %w", docVector.ChunkID, err)
-		}
-		log.Infof("[Processor] 分块 %d/%d 向量化并索引成功", i+1, len(savedVectors))
+	successCount := len(savedVectors) - len(failedChunks)
+	if len(failedChunks) > 0 {
+		log.Warnf("[Processor] 文件 %s 有 %d/%d 个分块处理失败: %v",
+			task.FileMD5, len(failedChunks), len(savedVectors), failedChunks)
 	}
-	log.Info("[Processor] 步骤4: 所有分块处理完毕")
 
-	log.Infof("[Processor] 文件处理成功完成, FileMD5: %s", task.FileMD5)
+	if successCount == 0 && len(savedVectors) > 0 {
+		return fmt.Errorf("所有 %d 个分块均处理失败", len(savedVectors))
+	}
+
+	elapsed := time.Since(processStart)
+	log.Infof("[Processor] 文件处理完成, FileMD5: %s, 成功: %d/%d, 耗时: %.2fs",
+		task.FileMD5, successCount, len(savedVectors), elapsed.Seconds())
 	return nil
 }
 
+// batchEmbedAndIndex 批量向量化并索引到 ES。
+// 使用信号量控制并发度，支持部分失败容错。
+// 返回失败的 ChunkID 列表。
+func (p *Processor) batchEmbedAndIndex(ctx context.Context, savedVectors []*model.DocumentVector) []int {
+	var failedChunks []int
+	var mu sync.Mutex
+	sem := make(chan struct{}, maxConcurrentWorkers)
+	var wg sync.WaitGroup
+
+	// 按 batchSize 分批处理
+	for i := 0; i < len(savedVectors); i += embeddingBatchSize {
+		end := i + embeddingBatchSize
+		if end > len(savedVectors) {
+			end = len(savedVectors)
+		}
+		batch := savedVectors[i:end]
+		batchIdx := i / embeddingBatchSize
+
+		wg.Add(1)
+		go func(batch []*model.DocumentVector, batchIdx int) {
+			defer wg.Done()
+			sem <- struct{}{}        // 获取信号量
+			defer func() { <-sem }() // 释放信号量
+
+			log.Infof("[Processor] 批次 %d: 开始处理 %d 个分块", batchIdx, len(batch))
+
+			// 收集文本
+			texts := make([]string, len(batch))
+			for j, dv := range batch {
+				texts[j] = dv.TextContent
+			}
+
+			// 批量向量化
+			vectors, err := p.embeddingClient.CreateEmbeddingBatch(ctx, texts)
+			if err != nil {
+				log.Errorf("[Processor] 批次 %d 批量向量化失败, Error: %v", batchIdx, err)
+				mu.Lock()
+				for _, dv := range batch {
+					failedChunks = append(failedChunks, dv.ChunkID)
+				}
+				mu.Unlock()
+				return
+			}
+
+			if len(vectors) != len(batch) {
+				log.Errorf("[Processor] 批次 %d 向量化结果数量不匹配: 期望 %d, 实际 %d",
+					batchIdx, len(batch), len(vectors))
+				mu.Lock()
+				for _, dv := range batch {
+					failedChunks = append(failedChunks, dv.ChunkID)
+				}
+				mu.Unlock()
+				return
+			}
+
+			// 逐个索引到 ES（单个索引失败不影响同批次其他分块）
+			for j, dv := range batch {
+				esDoc := model.EsDocument{
+					VectorID:     fmt.Sprintf("%s_%d", dv.FileMD5, dv.ChunkID),
+					FileMD5:      dv.FileMD5,
+					ChunkID:      dv.ChunkID,
+					FileName:     dv.FileName, // 新增：索引时包含文件名
+					TextContent:  dv.TextContent,
+					Vector:       vectors[j],
+					ModelVersion: p.embeddingCfg.Model,
+					UserID:       dv.UserID,
+					OrgTag:       dv.OrgTag,
+					IsPublic:     dv.IsPublic,
+				}
+
+				if err := es.IndexDocument(ctx, p.esCfg.IndexName, esDoc); err != nil {
+					log.Warnf("[Processor] 分块 %d 索引到ES失败, 跳过: %v", dv.ChunkID, err)
+					mu.Lock()
+					failedChunks = append(failedChunks, dv.ChunkID)
+					mu.Unlock()
+					continue
+				}
+			}
+			log.Infof("[Processor] 批次 %d 处理完成", batchIdx)
+		}(batch, batchIdx)
+	}
+
+	wg.Wait()
+	return failedChunks
+}
+
+// selectChunkParams 根据文件类型返回最优的分块参数。
+func (p *Processor) selectChunkParams(fileName string) (chunkSize int, chunkOverlap int) {
+	ext := strings.ToLower(filepath.Ext(fileName))
+	switch ext {
+	case ".md", ".markdown":
+		return 1500, 150
+	case ".go", ".java", ".py", ".js", ".ts", ".c", ".cpp":
+		return 1200, 100
+	default:
+		return 1000, 100
+	}
+}
+
+// describeChunkStrategy 返回当前文件使用的分块策略描述
+func (p *Processor) describeChunkStrategy(fileName string) string {
+	ext := strings.ToLower(filepath.Ext(fileName))
+	switch ext {
+	case ".md", ".markdown":
+		return "MarkdownSplitter"
+	case ".go", ".java", ".py", ".js", ".ts", ".c", ".cpp":
+		return "CodeAware"
+	default:
+		return "Default"
+	}
+}
+
 // splitText 将长文本按指定大小和重叠进行切分。
-// 对于 Markdown 文件，使用标题感知的 MarkdownSplitter；其他格式使用简单字符切分。
 func (p *Processor) splitText(text string, chunkSize int, chunkOverlap int, fileName string) []string {
-	// 判断是否为 Markdown 文件
+	// 1. 判断是否为 Markdown 文件
 	if isMarkdownFile(fileName) {
 		log.Infof("[Processor] 检测到 Markdown 文件, 使用 MarkdownSplitter: %s", fileName)
 		mdSplitter := splitter.NewMarkdownSplitter()
@@ -184,12 +295,22 @@ func (p *Processor) splitText(text string, chunkSize int, chunkOverlap int, file
 		if len(chunks) > 0 {
 			return chunks
 		}
-		log.Warnf("[Processor] MarkdownSplitter 未生成分块，降级为简单切分")
+		log.Warnf("[Processor] MarkdownSplitter 降级处理")
 	}
 
-	// 默认：简单字符切分
+	// 2. 判断是否为代码文件
+	if isCodeFile(fileName) {
+		log.Infof("[Processor] 检测到代码文件, 使用 CodeSplitter: %s", fileName)
+		codeSplitter := splitter.NewCodeSplitter(filepath.Ext(fileName))
+		chunks := codeSplitter.Split(text, chunkSize, chunkOverlap)
+		if len(chunks) > 0 {
+			return chunks
+		}
+		log.Warnf("[Processor] CodeSplitter 降级处理")
+	}
+
+	// 3. 默认：简单字符切分
 	if chunkSize <= chunkOverlap {
-		// Fallback to simple split if overlap is invalid
 		return p.simpleSplit(text, chunkSize)
 	}
 
@@ -233,4 +354,15 @@ func (p *Processor) simpleSplit(text string, chunkSize int) []string {
 func isMarkdownFile(fileName string) bool {
 	lower := strings.ToLower(fileName)
 	return strings.HasSuffix(lower, ".md") || strings.HasSuffix(lower, ".markdown")
+}
+
+// isCodeFile 判断文件是否为常见的代码文件格式
+func isCodeFile(fileName string) bool {
+	ext := strings.ToLower(filepath.Ext(fileName))
+	codeExts := map[string]bool{
+		".go": true, ".java": true, ".py": true, ".js": true, ".ts": true,
+		".c": true, ".cpp": true, ".h": true, ".hpp": true, ".cs": true,
+		".php": true, ".rb": true, ".rs": true, ".sh": true, ".sql": true,
+	}
+	return codeExts[ext]
 }

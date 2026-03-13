@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/go-redis/redis/v8"
@@ -26,7 +27,7 @@ import (
 
 // SearchService 接口定义了搜索操作。
 type SearchService interface {
-	HybridSearch(ctx context.Context, query string, topK int, user *model.User) ([]model.SearchResponseDTO, error)
+	HybridSearch(ctx context.Context, query string, topK int, user *model.User, history []model.ChatMessage) ([]model.SearchResponseDTO, error)
 }
 
 type searchService struct {
@@ -70,8 +71,19 @@ func NewSearchService(
 }
 
 // HybridSearch 执行与 Java 项目逻辑一致的两阶段混合搜索。
-func (s *searchService) HybridSearch(ctx context.Context, query string, topK int, user *model.User) ([]model.SearchResponseDTO, error) {
+func (s *searchService) HybridSearch(ctx context.Context, query string, topK int, user *model.User, history []model.ChatMessage) ([]model.SearchResponseDTO, error) {
+	searchStart := time.Now()
 	log.Infof("[SearchService] 开始执行混合搜索, query: '%s', topK: %d, user: %s", query, topK, user.Username)
+
+	// 慢查询日志：超过 2 秒的查询将被记录为警告
+	defer func() {
+		duration := time.Since(searchStart)
+		if duration > 2*time.Second {
+			log.Warnf("[SlowQuery] 查询耗时 %.2fs, Query: '%s', TopK: %d, User: %s",
+				duration.Seconds(), query, topK, user.Username)
+		}
+		log.Infof("[SearchService] 搜索总耗时: %.2fs", duration.Seconds())
+	}()
 
 	// 1. 获取用户有效的组织标签（包含层级关系）
 	log.Info("[SearchService] 步骤1: 获取用户有效组织标签")
@@ -121,15 +133,15 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 		}
 	}
 
-	// 3. 查询重写（Multi-Query）：生成多个变体查询以提升召回率
-	log.Info("[SearchService] 步骤3: 查询重写 (Multi-Query)")
+	// 3. 查询重写与扩写（Query Transformation）：生成多个变体查询以提升召回率
+	log.Info("[SearchService] 步骤3: 查询转换 (Rewriting & Expansion)")
 	allQueries := []string{query} // 始终包含原始查询
-	rewrittenQueries, err := s.rewriteQueries(ctx, query)
+	rewrittenQueries, err := s.rewriteQueries(ctx, query, history)
 	if err != nil {
 		log.Warnf("[SearchService] 查询重写失败，仅使用原始查询: %v", err)
 	} else if len(rewrittenQueries) > 0 {
 		allQueries = append(allQueries, rewrittenQueries...)
-		log.Infof("[SearchService] 查询重写完成，共 %d 个查询变体: %v", len(rewrittenQueries), rewrittenQueries)
+		log.Infof("[SearchService] 查询转换完成，共 %d 个查询变体: %v", len(allQueries), allQueries)
 	}
 
 	// 4. 向量化所有查询（并行）
@@ -208,7 +220,7 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 					"num_candidates": 100,
 					"filter":         boolFilter,
 				},
-				"_source": []string{"file_md5", "chunk_id", "text_content", "user_id", "org_tag", "is_public", "vector_id"},
+				"_source": []string{"file_md5", "file_name", "chunk_id", "text_content", "user_id", "org_tag", "is_public", "vector_id"},
 				"size":    recallSize,
 			}
 			docs, err := s.executeEsQuery(ctx, queryBody)
@@ -235,28 +247,36 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 			"filter": boolFilter,
 		}
 
-		// 构建 must/should 子句
-		var mustClauses []map[string]interface{}
+		var shouldClauses []map[string]interface{}
+
+		// 1. 添加核心关键词
 		for _, kw := range keywords.CoreKeywords {
-			mustClauses = append(mustClauses, map[string]interface{}{
+			shouldClauses = append(shouldClauses, map[string]interface{}{
 				"match": map[string]interface{}{
-					"text_content": kw,
+					"text_content": map[string]interface{}{
+						"query": kw,
+						"boost": 2.0, // 核心词权重更高
+					},
 				},
 			})
 		}
-		var shouldClauses []map[string]interface{}
+
+		// 2. 添加可选关键词
 		for _, kw := range keywords.OptionalKeywords {
 			shouldClauses = append(shouldClauses, map[string]interface{}{
 				"match": map[string]interface{}{
-					"text_content": kw,
+					"text_content": map[string]interface{}{
+						"query": kw,
+						"boost": 1.0,
+					},
 				},
 			})
 		}
 
 		// 如果没有任何关键词，使用 normalized query 作为兜底
-		if len(keywords.CoreKeywords) == 0 && len(keywords.OptionalKeywords) == 0 {
+		if len(shouldClauses) == 0 {
 			normalized, _ := normalizeQuery(query)
-			mustClauses = append(mustClauses, map[string]interface{}{
+			shouldClauses = append(shouldClauses, map[string]interface{}{
 				"match": map[string]interface{}{
 					"text_content": map[string]interface{}{
 						"query":                normalized,
@@ -266,18 +286,21 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 			})
 		}
 
-		if len(mustClauses) > 0 {
-			boolQuery["must"] = mustClauses
-		}
-		if len(shouldClauses) > 0 {
-			boolQuery["should"] = shouldClauses
+		boolQuery["should"] = shouldClauses
+
+		// 恢复严格匹配策略：由于已经有了多路 Query 重写和扩写，
+		// 我们不再需要降低检索阈值，而是要求核心词必须精准匹配以保证 Precision。
+		if len(keywords.CoreKeywords) > 0 {
+			boolQuery["minimum_should_match"] = "100%"
+		} else {
+			boolQuery["minimum_should_match"] = 1
 		}
 
 		queryBody := map[string]interface{}{
 			"query": map[string]interface{}{
 				"bool": boolQuery,
 			},
-			"_source": []string{"file_md5", "chunk_id", "text_content", "user_id", "org_tag", "is_public", "vector_id"},
+			"_source": []string{"file_md5", "file_name", "chunk_id", "text_content", "user_id", "org_tag", "is_public", "vector_id"},
 			"size":    recallSize,
 		}
 		sparseDocs, sparseErr = s.executeEsQuery(ctx, queryBody)
@@ -406,7 +429,11 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 
 	var results []model.SearchResponseDTO
 	for _, doc := range finalDocs {
-		fileName := fileNameMap[doc.Doc.FileMD5]
+		fileName := doc.Doc.FileName
+		// 如果 ES 中没存（旧数据），则尝试从刚才查询的 Map 中获取
+		if fileName == "" {
+			fileName = fileNameMap[doc.Doc.FileMD5]
+		}
 		if fileName == "" {
 			fileName = "未知文件"
 		}
@@ -434,16 +461,17 @@ func (s *searchService) HybridSearch(ctx context.Context, query string, topK int
 			}
 			cachedValue := strings.Join(docIDs, ",")
 
-			// 异步写入
-			go func(key, value string) {
+			// 异步写入（使用动态 TTL）
+			cacheTTL := s.getDynamicCacheTTL(query)
+			go func(key, value string, ttl time.Duration) {
 				// 使用 Background context 避免父 context 取消
 				cacheCtx := context.Background()
-				if err := s.redisClient.Set(cacheCtx, key, value, 24*3600*1000000000).Err(); err != nil { // 24小时 (纳秒)
+				if err := s.redisClient.Set(cacheCtx, key, value, ttl).Err(); err != nil {
 					log.Warnf("[SearchService] 缓存写入失败: %v", err)
 				} else {
-					log.Infof("[SearchService] 成功写入缓存, key: %s, docCount: %d", key, len(docIDs))
+					log.Infof("[SearchService] 成功写入缓存, key: %s, docCount: %d, ttl: %v", key, len(docIDs), ttl)
 				}
-			}(cacheKey, cachedValue)
+			}(cacheKey, cachedValue, cacheTTL)
 		}
 	}
 
@@ -588,11 +616,12 @@ func (s *searchService) executeEsQuery(ctx context.Context, queryBody map[string
 		return nil, fmt.Errorf("failed to encode query: %w", err)
 	}
 
+	// 优化：禁用 track_total_hits 以减少查询开销（我们不需要总数）
 	res, err := s.esClient.Search(
 		s.esClient.Search.WithContext(ctx),
 		s.esClient.Search.WithIndex("knowledge_base"),
 		s.esClient.Search.WithBody(&buf),
-		s.esClient.Search.WithTrackTotalHits(true),
+		s.esClient.Search.WithTrackTotalHits(false),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("es search failed: %w", err)
@@ -653,7 +682,7 @@ func (s *searchService) batchGetDocsByIDs(ctx context.Context, docIDs []string, 
 				},
 			},
 		},
-		"_source": []string{"file_md5", "chunk_id", "text_content", "user_id", "org_tag", "is_public", "vector_id"},
+		"_source": []string{"file_md5", "file_name", "chunk_id", "text_content", "user_id", "org_tag", "is_public", "vector_id"},
 		"size":    len(docIDs),
 	}
 
@@ -685,7 +714,10 @@ func (s *searchService) batchGetDocsByIDs(ctx context.Context, docIDs []string, 
 	// 转换为 DTO
 	var results []model.SearchResponseDTO
 	for _, doc := range docs {
-		fileName := fileNameMap[doc.FileMD5]
+		fileName := doc.FileName
+		if fileName == "" {
+			fileName = fileNameMap[doc.FileMD5]
+		}
 		if fileName == "" {
 			fileName = "未知文件"
 		}
@@ -746,23 +778,44 @@ func generateCacheKey(keywords *KeywordExtractionResult) string {
 	return "search_cache:" + strings.Join(normalizedKeys, "|")
 }
 
-// rewriteQueries 使用 LLM 将用户查询重写为多个变体，以提升向量检索的召回率。
-func (s *searchService) rewriteQueries(ctx context.Context, query string) ([]string, error) {
+// rewriteQueries 使用 LLM 处理查询转换：重写（针对口语/模糊/指代消解）+ 扩写（生成多路变体）。
+func (s *searchService) rewriteQueries(ctx context.Context, query string, history []model.ChatMessage) ([]string, error) {
 	if s.llmClient == nil {
 		return nil, nil
 	}
 
-	prompt := fmt.Sprintf(`你是一个查询重写专家。请将用户的问题改写为 2-3 个不同表述但语义相同的查询，用于提升搜索召回率。
+	// 准备对话历史上下文
+	historyContext := "无"
+	if len(history) > 0 {
+		var sb strings.Builder
+		// 仅取最近 3 轮
+		start := 0
+		if len(history) > 6 {
+			start = len(history) - 6
+		}
+		for i := start; i < len(history); i++ {
+			sb.WriteString(fmt.Sprintf("%s: %s\n", history[i].Role, history[i].Content))
+		}
+		historyContext = sb.String()
+	}
 
-要求：
-1. 每个改写应使用不同的表达方式（同义词替换、角度转换、抽象/具体化）
-2. 保持与原问题相同的核心语义
-3. 不要添加原问题中没有的信息
+	prompt := fmt.Sprintf(`你是一个搜索优化专家。请根据以下用户问题和对话历史，生成 3 个最适合搜索引擎检索的改写变体。
 
-用户问题："%s"
+任务要求：
+1. **指代消解**：如果问题中包含“他”、“它”、“那个”等代词，请根据历史上下文将其替换为具体的名词。
+2. **Query 重写**：将口语化、模糊化的输入（如“理赔咋整”）改写成专业、书面的形式（如“理赔流程和申请规则”）。
+3. **Query 扩写**：生成 3 个语义相同但用词不同的检索变体（例如包含同义词、行业术语）。
 
-请严格按照以下 JSON 格式返回，不要包含任何其他文字：
-{"queries": ["改写1", "改写2", "改写3"]}`, query)
+---
+【对话历史】
+%s
+
+【用户原始问题】
+"%s"
+---
+
+请严格按照以下 JSON 格式返回，不要包含任何其他说明文字：
+{"queries": ["改写变体1", "改写变体2", "改写变体3"]}`, historyContext, query)
 
 	messages := []llm.Message{
 		{Role: "user", Content: prompt},
@@ -789,16 +842,43 @@ func (s *searchService) rewriteQueries(ctx context.Context, query string) ([]str
 		return nil, fmt.Errorf("failed to parse query rewrite JSON: %w", err)
 	}
 
-	// 过滤空查询和与原查询完全相同的结果
+	// 过滤空查询
 	var rewritten []string
 	for _, q := range result.Queries {
 		q = strings.TrimSpace(q)
-		if q != "" && q != query {
+		if q != "" {
 			rewritten = append(rewritten, q)
 		}
 	}
 
 	return rewritten, nil
+}
+
+// getDynamicCacheTTL 根据查询频率动态调整缓存 TTL。
+// 优化：高频查询缓存时间更长，低频查询及时释放，平衡内存与检索效率。
+func (s *searchService) getDynamicCacheTTL(query string) time.Duration {
+	freq := s.getQueryFrequency(query)
+	switch {
+	case freq > 100: // 高频查询
+		return 7 * 24 * time.Hour
+	case freq > 10: // 中频查询
+		return 24 * time.Hour
+	default: // 低频查询
+		return 1 * time.Hour
+	}
+}
+
+// getQueryFrequency 从 Redis 获取查询频率计数。
+func (s *searchService) getQueryFrequency(query string) int64 {
+	if s.redisClient == nil {
+		return 0
+	}
+	// 记录并返回频率
+	key := "query_freq:" + query
+	freq, _ := s.redisClient.Incr(context.Background(), key).Result()
+	// 设置 7 天过期，滑动窗口统计
+	_ = s.redisClient.Expire(context.Background(), key, 7*24*time.Hour).Err()
+	return freq
 }
 
 // deduplicateDocs 根据 VectorID 对文档进行去重。

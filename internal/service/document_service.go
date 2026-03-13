@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
+	"io"
 	"pai-smart-go/internal/config"
 	"pai-smart-go/internal/model"
 	"pai-smart-go/internal/repository"
@@ -44,6 +44,7 @@ type DocumentService interface {
 	DeleteDocument(fileMD5 string, user *model.User) error
 	GenerateDownloadURL(fileName string, user *model.User) (*DownloadInfoDTO, error)
 	GetFilePreviewContent(fileName string, user *model.User) (*PreviewInfoDTO, error)
+	GenerateBrowserPreviewURL(fileName string, user *model.User) (string, error)
 }
 
 type documentService struct {
@@ -129,17 +130,41 @@ func (s *documentService) GenerateDownloadURL(fileName string, user *model.User)
 
 	// 生成预签名的 URL，有效期为1小时
 	expiry := time.Hour
-	objectName := fmt.Sprintf("uploads/%d/%s", targetFile.UserID, targetFile.FileName)
-	presignedURL, err := storage.MinioClient.PresignedGetObject(context.Background(), s.minioCfg.BucketName, objectName, expiry, url.Values{})
+	// 统一使用 merged/ 路径，且由 UploadService 维护
+	objectName := fmt.Sprintf("merged/%s", targetFile.FileName)
+	presignedURL, err := storage.GetPresignedURL(s.minioCfg.BucketName, objectName, expiry, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	return &DownloadInfoDTO{
 		FileName:    targetFile.FileName,
-		DownloadURL: presignedURL.String(),
+		DownloadURL: presignedURL,
 		FileSize:    targetFile.TotalSize,
 	}, nil
+}
+
+// GenerateBrowserPreviewURL 生成支持各浏览器直接打开的预览链接（Content-Disposition: inline）
+func (s *documentService) GenerateBrowserPreviewURL(fileName string, user *model.User) (string, error) {
+	files, err := s.ListAccessibleFiles(user)
+	if err != nil {
+		return "", err
+	}
+
+	var targetFile *model.FileUpload
+	for i := range files {
+		if files[i].FileName == fileName {
+			targetFile = &files[i]
+			break
+		}
+	}
+
+	if targetFile == nil {
+		return "", errors.New("文件不存在或无权访问")
+	}
+
+	objectName := fmt.Sprintf("merged/%s", targetFile.FileName)
+	return storage.GetBrowserViewURL(s.minioCfg.BucketName, objectName, time.Hour)
 }
 
 // GetFilePreviewContent 获取文件的纯文本预览内容。
@@ -163,14 +188,27 @@ func (s *documentService) GetFilePreviewContent(fileName string, user *model.Use
 	}
 
 	// 从 MinIO 获取文件对象
-	objectName := fmt.Sprintf("uploads/%d/%s", targetFile.UserID, targetFile.FileName)
+	objectName := fmt.Sprintf("merged/%s", targetFile.FileName)
 	object, err := storage.MinioClient.GetObject(context.Background(), s.minioCfg.BucketName, objectName, minio.GetObjectOptions{})
 	if err != nil {
 		return nil, err
 	}
 	defer object.Close()
 
-	// 将文件流发送给 Tika 进行文本提取
+	// 对于 .md 和 .txt 文件，直接读取原始内容，不经过 Tika (避免丢失 Markdown 格式)
+	if strings.HasSuffix(strings.ToLower(fileName), ".md") || strings.HasSuffix(strings.ToLower(fileName), ".txt") {
+		contentBytes, err := io.ReadAll(object)
+		if err != nil {
+			return nil, err
+		}
+		return &PreviewInfoDTO{
+			FileName: targetFile.FileName,
+			Content:  string(contentBytes),
+			FileSize: targetFile.TotalSize,
+		}, nil
+	}
+
+	// 其他文件类型将文件流发送给 Tika 进行文本提取
 	content, err := s.tikaClient.ExtractText(object, fileName)
 	if err != nil {
 		return nil, err

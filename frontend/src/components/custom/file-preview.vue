@@ -36,7 +36,8 @@
       </template>
       <template v-else>
         <div class="content-wrapper">
-          <pre class="preview-text">{{ content }}</pre>
+          <VueMarkdownIt v-if="isMarkdown" :content="content" />
+          <pre v-else class="preview-text">{{ content }}</pre>
         </div>
       </template>
     </div>
@@ -44,8 +45,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { NButton, NSpin } from 'naive-ui';
+import { VueMarkdownIt } from 'vue-markdown-shiki';
 import SvgIcon from '@/components/custom/svg-icon.vue';
 import { request } from '@/service/request';
 import { getFileExt } from '@/utils/common';
@@ -66,6 +68,11 @@ const loading = ref(false);
 const downloading = ref(false);
 const content = ref('');
 const error = ref('');
+
+const isMarkdown = computed(() => {
+  const ext = getFileExt(props.fileName);
+  return ext?.toLowerCase() === 'md';
+});
 
 // 获取文件图标
 function getFileIcon(fileName: string) {

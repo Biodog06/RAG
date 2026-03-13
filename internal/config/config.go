@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -163,6 +164,11 @@ type SegmenterConfig struct {
 func Init(configPath string) {
 	viper.SetConfigFile(configPath)
 	viper.SetConfigType("yaml")
+
+	// 启用环境变量读取
+	viper.AutomaticEnv()
+	// 允许使用 _ 替换 . (例如：SERVER_PORT 对应 server.port)
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	if err := viper.ReadInConfig(); err != nil {
 		panic(fmt.Errorf("读取配置文件失败: %w", err))
