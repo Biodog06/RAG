@@ -44,7 +44,7 @@ elasticsearch:
 # Embedding model config
 embedding:
   model: "text-embedding-v4"
-  api_key: "sk-6f83184867514c0fb4ead4d31ec11303"
+  api_key: ""
   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
   dimensions: 2048
 
@@ -52,7 +52,7 @@ embedding:
 rerank:
   enable: true
   model: "qwen3-rerank" # 示例模型名
-  api_key: "sk-6f83184867514c0fb4ead4d31ec11303" # 请替换为您的 Key
+  api_key: "" # 请替换为您的 Key
   base_url: "https://dashscope.aliyuncs.com/compatible-api/v1/reranks" # 示例地址（如硅基流动/Jina）
   min_score: 0.3 # 低于此分数的会被过滤掉
 
@@ -60,7 +60,7 @@ rerank:
 llm:
   base_url: "https://api.deepseek.com/v1"  # 本地是 http://localhost:11434/v1 官方：https://api.deepseek.com/v1
   model: deepseek-chat  # 本地: deepseek-r1:7b, 官方: deepseek-chat
-  api_key: "sk-7d18e7cc656041e18062e8ce86bf0d7c"
+  api_key: ""
   prompt:
     rules: |
       你是知识助手，须遵守：
