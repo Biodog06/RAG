@@ -55,8 +55,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <Suspense>
-    <NScrollbar ref="scrollbarRef" class="h-0 flex-auto">
+    <NScrollbar ref="scrollbarRef" class="h-0 flex-auto flex-1">
       <Teleport defer to="#header-extra">
         <div class="px-10">
           <NForm :model="params" label-placement="left" :show-feedback="false" inline>
@@ -72,7 +71,6 @@ onMounted(() => {
         </VueMarkdownItProvider>
       </NSpin>
     </NScrollbar>
-  </Suspense>
 </template>
 
 <style scoped lang="scss"></style>

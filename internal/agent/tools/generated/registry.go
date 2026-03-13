@@ -1,12 +1,14 @@
 package generated
 
 import (
+	"pai-smart-go/pkg/log"
 	"github.com/cloudwego/eino/components/tool"
 )
 
 // GetGeneratedTools returns a list of all dynamically generated tools.
 // This file is automatically updated by the tool codegen service.
 func GetGeneratedTools() []tool.InvokableTool {
+	log.Infof("[Registry] GetGeneratedTools called")
 	tools := make([]tool.InvokableTool, 0)
 
 	// 所有 generated 目录下的工具现在都通过动态加载器即时引入

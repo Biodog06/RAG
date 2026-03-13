@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
-import { useMessage, NButton, NSpin, NCard, NTag } from 'naive-ui';
+import { useMessage } from 'naive-ui';
+import { fetchChatTools } from '@/service/api/chat';
 
 interface Tool {
   name: string;
@@ -8,25 +9,11 @@ interface Tool {
   isGenerated: boolean;
 }
 
-const message = useMessage();
-const tools = ref<Tool[]>([]);
-const loading = ref(false);
+const chatStore = useChatStore();
+const { tools, loadingTools: loading } = storeToRefs(chatStore);
 
 async function fetchTools() {
-  loading.value = true;
-  try {
-    const response = await fetch('/api/v1/chat/tools');
-    const result = await response.json();
-    if (result.code === 200) {
-      tools.value = result.data;
-    } else {
-      message.error(result.message || '获取工具列表失败');
-    }
-  } catch (err) {
-    message.error('网络错误，请稍后重试');
-  } finally {
-    loading.value = false;
-  }
+  await chatStore.fetchTools();
 }
 
 onMounted(() => {

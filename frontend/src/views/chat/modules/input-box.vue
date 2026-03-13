@@ -17,21 +17,38 @@ const sendable = computed(
 );
 
 watch(wsData, val => {
-  const data = JSON.parse(val);
-  const assistant = list.value[list.value.length - 1];
+  if (!val) return;
+  console.log('Received WS message:', val);
+  try {
+    const data = JSON.parse(val);
+    const assistant = list.value[list.value.length - 1];
+    if (!assistant || assistant.role !== 'assistant') {
+      console.warn('No assistant message at the end of the list');
+      return;
+    }
 
-  if (data.type === 'completion' && data.status === 'finished' && assistant.status !== 'error')
-    assistant.status = 'finished';
-  if (data.error) assistant.status = 'error';
-  else if (data.chunk) {
-    assistant.status = 'loading';
-    assistant.content += data.chunk;
+    if (data.type === 'completion' && data.status === 'finished' && assistant.status !== 'error') {
+      assistant.status = 'finished';
+      console.log('--- Dialogue Finished: Triggering Tool List Refresh ---');
+      chatStore.fetchTools();
+    }
+    if (data.error) {
+      assistant.status = 'error';
+      window.$message?.error(data.error);
+    } else if (data.chunk) {
+      assistant.status = 'loading';
+      assistant.content += data.chunk;
+    }
+  } catch (err) {
+    console.error('Failed to parse WS message:', err);
   }
 });
 
 const handleSend = async () => {
+  console.log('handleSend called, input:', input.value.message);
   //  判断是否正在发送, 如果发送中，则停止ai继续响应
   if (isSending.value) {
+    console.log('Currently sending, triggering stop');
     const { error, data } = await request<Api.Chat.Token>({ url: 'chat/websocket-token', baseURL: 'proxy-api' });
     if (error) return;
 
@@ -42,16 +59,28 @@ const handleSend = async () => {
     return;
   }
 
-  list.value.push({
+  if (!input.value.message) return;
+
+  const newUserMsg = {
     content: input.value.message,
-    role: 'user'
-  });
+    role: 'user' as const,
+    timestamp: new Date().toISOString()
+  };
+  console.log('Pushing user message to list:', newUserMsg);
+  list.value.push(newUserMsg);
+  
+  console.log('Sending message via WS:', input.value.message);
   chatStore.wsSend(input.value.message);
-  list.value.push({
+  
+  const newAssistantMsg = {
     content: '',
-    role: 'assistant',
-    status: 'pending'
-  });
+    role: 'assistant' as const,
+    status: 'pending' as const,
+    timestamp: new Date().toISOString()
+  };
+  console.log('Pushing assistant message to list:', newAssistantMsg);
+  list.value.push(newAssistantMsg);
+  
   input.value.message = '';
 };
 

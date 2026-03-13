@@ -90,21 +90,12 @@ func GenerateToolCodeFromUserInput(ctx context.Context, llmClient llm.Client, re
 }
 
 func generateToolFileFromRequest(ctx context.Context, llmClient llm.Client, requirement string) (*generatedToolResult, error) {
-	systemPrompt := `你是一个Go工程代码生成器。请根据用户需求生成一个可编译的 Eino Tool Go 文件。
-输出必须是严格 JSON（不要 markdown 代码块，不要额外解释），字段如下：
-{
-  "tool_name": "snake_case",
-  "file_name": "snake_case.go",
-  "summary": "一句中文功能说明",
-  "register_hint": "已自动注册",
-  "code": "完整 Go 源码字符串"
-}
-要求：
-1) code 必须可编译。尽量包含必要的 import 依赖。
-2) package 名称固定为 generated。
-3) tool 构造函数命名为 NewXxxTool，返回 (tool.InvokableTool, error)。
-4) 强烈建议使用 utils.InferTool 来简化实现，例如：utils.InferTool("name", "desc", func(ctx context.Context, input *InputStruct) (string, error) { ... })。
-5) 优先给出可运行实现；如果涉及外部 API，尽量使用 http.Get/Post 实现简单的逻辑；可以提供 mock 逻辑作为回退。`
+	skillPath := "internal/agent/skills/tool_generation.md"
+	skillContent, err := os.ReadFile(skillPath)
+	systemPrompt := `你是一个Go工程代码生成器。请根据用户需求生成一个可编译的 Eino Tool Go 文件。`
+	if err == nil {
+		systemPrompt += "\n\n请严格遵守以下【工具生成规范】：\n" + string(skillContent)
+	}
 
 	raw, err := llmClient.GenerateOneShot(ctx, []llm.Message{
 		{Role: "system", Content: systemPrompt},
@@ -116,6 +107,11 @@ func generateToolFileFromRequest(ctx context.Context, llmClient llm.Client, requ
 
 	jsonText, err := extractFirstJSONObject(raw)
 	if err != nil {
+		snippet := raw
+		if len(snippet) > 200 {
+			snippet = snippet[:200] + "..."
+		}
+		log.Errorf("[ToolCodegen] JSON extraction failed. Raw output snippet: %s", snippet)
 		return nil, fmt.Errorf("invalid llm json output: %w", err)
 	}
 
@@ -164,10 +160,6 @@ func generateToolFileFromRequest(ctx context.Context, llmClient llm.Client, requ
 		registerHint = "已自动动态加载，无需重启，下一波对话即可直接使用！"
 	}
 
-	if err := registerGeneratedToolToRegistry(toolName); err != nil {
-		log.Warnf("register generated tool to registry failed: %v", err)
-	}
-
 	if err := appendGeneratedToolIndex(toolName, filePath, requirement); err != nil {
 		log.Warnf("append generated tool index failed: %v", err)
 	}
@@ -180,58 +172,33 @@ func generateToolFileFromRequest(ctx context.Context, llmClient llm.Client, requ
 	}, nil
 }
 
-func registerGeneratedToolToRegistry(toolName string) error {
-	registryFile := "internal/agent/tools/generated/registry.go"
-	content, err := os.ReadFile(registryFile)
-	if err != nil {
-		return err
-	}
-
-	lines := strings.Split(string(content), "\n")
-	newLines := make([]string, 0, len(lines)+5)
-
-	funcName := toCamelCase(toolName)
-	registrationLine := fmt.Sprintf("\tif t, err := New%sTool(); err == nil {", funcName)
-	
-	// Check if already registered
-	for _, line := range lines {
-		if strings.Contains(line, registrationLine) {
-			return nil // Already registered
-		}
-	}
-
-	for _, line := range lines {
-		if strings.TrimSpace(line) == "return tools" {
-			newLines = append(newLines, registrationLine)
-			newLines = append(newLines, "\t\ttools = append(tools, t)")
-			newLines = append(newLines, "\t}")
-			newLines = append(newLines, "")
-		}
-		newLines = append(newLines, line)
-	}
-
-	return os.WriteFile(registryFile, []byte(strings.Join(newLines, "\n")), 0o644)
-}
-
 func isToolGenerationIntent(query string) bool {
 	q := strings.ToLower(strings.TrimSpace(query))
 	if q == "" {
 		return false
 	}
 
-	cnDirect := []string{"新增功能", "添加功能", "新增tool", "新建tool", "创建tool", "生成tool", "写一个tool", "加一个tool", "开发一个tool", "给我写个功能"}
+	// Direct keyword matches
+	cnDirect := []string{
+		"新增功能", "添加功能", "新增tool", "新建tool", "创建tool", "生成tool", "写一个tool", "加一个tool", "开发一个tool", "给我写个功能",
+		"写一个工具", "加一个工具", "开发一个工具", "创建一个工具", "生成一个工具", "新建工具", "创建工具", "生成工具", "增加工具",
+	}
 	for _, k := range cnDirect {
 		if strings.Contains(q, k) {
 			return true
 		}
 	}
 
-	enActions := []string{"create", "add", "new", "generate", "build", "implement"}
-	hasToolWord := strings.Contains(q, "tool")
-	if hasToolWord {
-		for _, a := range enActions {
-			if strings.Contains(q, a) {
-				return true
+	// Combination matches: action + target
+	actions := []string{"创建", "新增", "生成", "开发", "添加", "增加", "写", "实现", "create", "add", "new", "generate", "build", "implement"}
+	targets := []string{"tool", "工具", "插件", "功能"}
+
+	for _, t := range targets {
+		if strings.Contains(q, t) {
+			for _, a := range actions {
+				if strings.Contains(q, a) {
+					return true
+				}
 			}
 		}
 	}

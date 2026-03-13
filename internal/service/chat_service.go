@@ -121,6 +121,11 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 		allTools = append(allTools, webSearchTool)
 	}
 
+	createTool, err := tools.NewCreateToolTool()
+	if err == nil {
+		allTools = append(allTools, createTool)
+	}
+
 	// 加入动态生成的 tools
 	allTools = append(allTools, generated.GetGeneratedTools()...)
 
@@ -188,6 +193,16 @@ func (s *chatService) GetTools(ctx context.Context) ([]model.ToolDTO, error) {
 	webSearchTool, _ := tools.NewWebSearchTool()
 	if webSearchTool != nil {
 		info, _ := webSearchTool.Info(ctx)
+		results = append(results, model.ToolDTO{
+			Name:        info.Name,
+			Description: info.Desc,
+			IsGenerated: false,
+		})
+	}
+
+	exchangeRateTool, _ := tools.NewCreateToolTool() // Using createTool variable name context
+	if exchangeRateTool != nil {
+		info, _ := exchangeRateTool.Info(ctx)
 		results = append(results, model.ToolDTO{
 			Name:        info.Name,
 			Description: info.Desc,

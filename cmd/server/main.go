@@ -108,8 +108,8 @@ func main() {
 	// 8. 设置 Gin 模式并创建路由引擎
 	gin.SetMode(cfg.Server.Mode)
 	r := gin.New() // 使用 New() 创建一个不带默认中间件的引擎
-	// 添加我们自定义的日志中间件和 Gin 的 Recovery 中间件
-	r.Use(middleware.RequestLogger(), gin.Recovery())
+	// 添加我们自定义的日志中间件、CORS 中间件和 Gin 的 Recovery 中间件
+	r.Use(middleware.RequestLogger(), middleware.Cors(), gin.Recovery())
 
 	// 9. 注册路由
 	apiV1 := r.Group("/api/v1")

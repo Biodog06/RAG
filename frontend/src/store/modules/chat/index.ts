@@ -5,6 +5,17 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
   const input = ref<Api.Chat.Input>({ message: '' });
 
   const list = ref<Api.Chat.Message[]>([]);
+  const tools = ref<any[]>([]);
+  const loadingTools = ref(false);
+
+  async function fetchTools() {
+    loadingTools.value = true;
+    const { data, error } = await fetchChatTools();
+    if (!error) {
+      tools.value = data || [];
+    }
+    loadingTools.value = false;
+  }
 
   const store = useAuthStore();
 
@@ -24,6 +35,9 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
     input,
     conversationId,
     list,
+    tools,
+    loadingTools,
+    fetchTools,
     wsStatus,
     wsData,
     wsSend,

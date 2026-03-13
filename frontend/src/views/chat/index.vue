@@ -19,9 +19,9 @@ function handleTabChange(value: string) {
 <template>
   <n-card :bordered="false" class="h-full">
     <n-tabs v-model:value="activeTab" type="segment" animated @update:value="handleTabChange">
-      <n-tab-pane name="chat" tab="AI 聊天">
-        <div class="flex-col gap-4 mt-4">
-          <ChatList />
+      <n-tab-pane name="chat" tab="AI 聊天" class="h-full">
+        <div class="flex flex-col h-[calc(100vh-180px)] gap-4 mt-2">
+          <ChatList class="flex-1" />
           <InputBox />
         </div>
       </n-tab-pane>
