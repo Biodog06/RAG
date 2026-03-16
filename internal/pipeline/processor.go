@@ -4,6 +4,7 @@ package pipeline
 import (
 	"bytes" // 引入 bytes 包
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"pai-smart-go/internal/config"
@@ -12,7 +13,10 @@ import (
 	"pai-smart-go/pkg/embedding"
 	"pai-smart-go/pkg/es"
 	"pai-smart-go/pkg/log"
+	"pai-smart-go/pkg/llm"
 	"pai-smart-go/pkg/splitter"
+	"pai-smart-go/pkg/database"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 	"pai-smart-go/pkg/storage"
 	"pai-smart-go/pkg/tasks"
 	"pai-smart-go/pkg/mineru"
@@ -43,6 +47,7 @@ type Processor struct {
 	embeddingCfg    config.EmbeddingConfig
 	uploadRepo      repository.UploadRepository
 	docVectorRepo   repository.DocumentVectorRepository
+	llmClient       llm.Client
 }
 
 // NewProcessor 创建一个新的 Processor 实例。
@@ -55,6 +60,7 @@ func NewProcessor(
 	embeddingCfg config.EmbeddingConfig,
 	uploadRepo repository.UploadRepository,
 	docVectorRepo repository.DocumentVectorRepository,
+	llmClient llm.Client,
 ) *Processor {
 	return &Processor{
 		mineruClient:    mineruClient,
@@ -65,6 +71,7 @@ func NewProcessor(
 		embeddingCfg:    embeddingCfg,
 		uploadRepo:      uploadRepo,
 		docVectorRepo:   docVectorRepo,
+		llmClient:       llmClient,
 	}
 }
 
@@ -194,6 +201,10 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 	elapsed := time.Since(processStart)
 	log.Infof("[Processor] 文件处理完成, FileMD5: %s, 成功: %d/%d, 耗时: %.2fs",
 		task.FileMD5, successCount, len(savedVectors), elapsed.Seconds())
+
+	// 5. 异步启动图谱提取流程 (Graph RAG)
+	go p.extractAndIndexGraph(context.Background(), task, chunks)
+
 	return nil
 }
 
@@ -404,4 +415,114 @@ func isExcelFile(ext string) bool {
 		".xlsx": true, ".xls": true, ".csv": true,
 	}
 	return exts[ext]
+}
+
+// extractAndIndexGraph 从文本中提取三元组并存入 Neo4j。
+func (p *Processor) extractAndIndexGraph(ctx context.Context, task tasks.FileProcessingTask, chunks []string) {
+	if database.Neo4jDriver == nil {
+		log.Warnf("[Processor] Neo4j 未就绪，跳过图谱提取")
+		return
+	}
+
+	log.Infof("[Processor] 启动图谱提取流程, FileMD5: %s, 共 %d 个分块", task.FileMD5, len(chunks))
+
+	// 先清理旧数据（幂等性）
+	if err := p.deleteGraphByFileMD5(ctx, task.FileMD5); err != nil {
+		log.Warnf("[Processor] 清理 Neo4j 旧数据失败: %v", err)
+	}
+
+	// 为了避免过度消耗 LLM 资源，我们限制提取的分块数量
+	maxChunks := 10
+	if len(chunks) < maxChunks {
+		maxChunks = len(chunks)
+	}
+
+	for i := 0; i < maxChunks; i++ {
+		triplets, err := p.extractTriplets(ctx, chunks[i])
+		if err != nil {
+			log.Warnf("[Processor] 分块 %d 提取三元组失败: %v", i, err)
+			continue
+		}
+		if len(triplets) > 0 {
+			if err := p.saveTripletsToNeo4j(ctx, task, triplets); err != nil {
+				log.Errorf("[Processor] 分块 %d 保存三元组到 Neo4j 失败: %v", i, err)
+			}
+		}
+	}
+	log.Infof("[Processor] 图谱提取流程结束, FileMD5: %s", task.FileMD5)
+}
+
+type GraphTriplet struct {
+	Subject   string `json:"subject"`
+	Predicate string `json:"predicate"`
+	Object    string `json:"object"`
+}
+
+func (p *Processor) extractTriplets(ctx context.Context, text string) ([]GraphTriplet, error) {
+	prompt := fmt.Sprintf(`你是一个知识图谱专家。请从以下文本中提取实体及其关系（三元组）。
+请仅输出 JSON 数组格式，不要有任何解释。如果是空的则返回 []。
+格式：[{"subject": "实体1", "predicate": "关系", "object": "实体2"}]
+
+文本："%s"`, text)
+
+	messages := []llm.Message{
+		{Role: "user", Content: prompt},
+	}
+
+	resp, err := p.llmClient.GenerateOneShot(ctx, messages)
+	if err != nil {
+		return nil, err
+	}
+
+	// 简单的 JSON 块提取逻辑
+	start := strings.Index(resp, "[")
+	end := strings.LastIndex(resp, "]")
+	if start == -1 || end == -1 {
+		return nil, nil
+	}
+
+	var triplets []GraphTriplet
+	if err := json.Unmarshal([]byte(resp[start:end+1]), &triplets); err != nil {
+		return nil, err
+	}
+
+	return triplets, nil
+}
+
+func (p *Processor) saveTripletsToNeo4j(ctx context.Context, task tasks.FileProcessingTask, triplets []GraphTriplet) error {
+	session := database.Neo4jDriver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		for _, t := range triplets {
+			cypher := `
+			MERGE (s:Entity {name: $sub})
+			MERGE (o:Entity {name: $obj})
+			MERGE (s)-[r:RELATION {type: $pred}]->(o)
+			SET s.file_md5 = $md5, o.file_md5 = $md5, r.file_md5 = $md5
+			RETURN r
+			`
+			params := map[string]interface{}{
+				"sub":  t.Subject,
+				"obj":  t.Object,
+				"pred": t.Predicate,
+				"md5":  task.FileMD5,
+			}
+			if _, err := tx.Run(ctx, cypher, params); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	})
+	return err
+}
+
+func (p *Processor) deleteGraphByFileMD5(ctx context.Context, fileMD5 string) error {
+	session := database.Neo4jDriver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		cypher := `MATCH (n {file_md5: $md5}) DETACH DELETE n`
+		return tx.Run(ctx, cypher, map[string]interface{}{"md5": fileMD5})
+	})
+	return err
 }
