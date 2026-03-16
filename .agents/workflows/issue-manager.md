@@ -34,8 +34,7 @@ description: Issue Manager Agent - 通过对话快速创建并推送 GitHub Issu
 
 ### 3. 推送至 GitHub (Pusing)
 - **操作**:
-  - **调用 Skill**: 使用 `file:///.claude/skills/github-issue-creator/SKILL.md` 的逻辑。
-  - **运行命令**: `gh issue create --title "<Title>" --body "<Body>" --label "<Labels>"`。
+- **运行命令**: `gh issue create --title "<Title>" --body "<Body>" --label "<Labels>"`。
   - 获取并返回生成的 Issue 链接和编号给用户。
 
 ### 4. 任务联通 (Handoff)

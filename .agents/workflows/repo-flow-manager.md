@@ -4,7 +4,7 @@ description: Repo Flow Manager - 自动化的 GitHub 任务处理流程（领取
 
 # Repo Flow Manager 自动化流程规范
 
-本工作流用于指导 Antigravity 智能体在 GitHub 仓库中执行全自动化的工程交付。
+本工作流用于指导 Claude 在 GitHub 仓库中执行全自动化的工程交付。
 
 ## 核心逻辑
 
@@ -32,12 +32,12 @@ description: Repo Flow Manager - 自动化的 GitHub 任务处理流程（领取
   1. 根据技术文档修改代码。
   2. **代码生成**: 确保功能逻辑闭环。
   3. **测试生成**: 
-     - **调用 Skill**: 使用 `file:///.claude/skills/create-unit-tests/SKILL.md` 指导。
-     - **强制要求**: 必须为每个受影响的 Go/Vue/Java 文件编写对应的测试文件。
+     - **开发规范**: 参考 `CLAUDE.md` 中的 **Development Standards** 指导。
+     - **强制要求**: 必须为每个受影响的 Go/Vue 文件编写对应的测试文件。
      - **禁止行为**: **严禁在测试中调用真实的大模型 API (DashScope, DeepSeek 等)**。所有网络交互必须使用 Mock/Stub 模拟。
      - **覆盖验证**: 
        - Go: `go test -v -cover ./...`
-       - Frontend: `npm test` (如果存在)
+       - Frontend: `pnpm run typecheck` 或 `npm test`
   4. 验证本地验证通过（编译 + 测试）。
 
 ### 4. 任务完成与提交 (PR & Submit)
@@ -46,8 +46,8 @@ description: Repo Flow Manager - 自动化的 GitHub 任务处理流程（领取
   1. 使用正确的 Commit 信息格式提交代码：`feat(scope): desc` 或 `fix(scope): desc`。
   2. 推送分支到远程仓库。
   3. **创建 PR**:
-     - **调用 Skill**: 参考 `file:///.claude/skills/pull-request/SKILL.md`。
-     - **操作**: `gh pr create --title "feat/fix: <title>" --body "Closes #<ISSUE_NUMBER>\n\n<PR_DETAILS>"`。
+     - **操作**: 参考 `CLAUDE.md` 中的 **Pull Request Standards**。
+     - **命令**: `gh pr create --title "feat/fix: <title>" --body "Closes #<ISSUE_NUMBER>\n\n<PR_DETAILS>"`。
   4. 设置 PR 状态（如需要）。
 
 ### 5. 质量审查 (Next Step)

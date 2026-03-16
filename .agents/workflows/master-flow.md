@@ -21,15 +21,15 @@ graph TD
     H -- 是 --> I[合并代码并关闭 Issue]
 ```
 
-## 自动化钩子 (Hook Mechanism)
+## 自动化联动机制
 
-为了实现“一直等待开启”的效果，我们利用了 Claude 的 **Skill Hook** 机制。
+为了实现高效协作，Claude 会根据上下文或关键词自动识别并建议运行对应工作流。
 
-| 智能体 | 激活钩子 (Hooks) | 触发条件 (Auto-Trigger) |
+| 流程 | 激活关键词 | 触发时机 |
 | :--- | :--- | :--- |
-| **Issue Manager** | `Initial Entry` | 监听到“新需求”、“创建任务”等关键词。 |
-| **Repo Flow Manager** | `Post-Issue-Create` | 当 Issue 创建成功，或者监听到“开始开发”、“领取任务”时。 |
-| **Code Review Agent** | `Post-Implementation` | 当代码完成、创建 PR 或监听到“提交代码”时。 |
+| **Issue Manager** | `新需求`, `创建任务` | 初始需求讨论阶段。 |
+| **Repo Flow Manager** | `开始开发`, `领取任务` | 当 Issue 创建成功，或者准备开始编码时。 |
+| **Code Review Agent** | `代码审查`, `提交代码` | 当代码完成、创建 PR 或需要质量检查时。 |
 
 ### 3. 质量把控 (PR -> Merge)
 - **指令**: "开启代码审查" 或 "启动 Code Review"。

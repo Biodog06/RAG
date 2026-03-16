@@ -16,16 +16,31 @@ PaiSmart (派聪明) is an enterprise-level AI knowledge base management system 
 - **Segmentation:** `go-ego/gse` (Chinese word segmentation, optional)
 - **Security:** JWT authentication, role-based authorization
 
-## Workflow Agents & Skills
+## Automated Workflows
 
-This repository uses a set of automated agents for its development lifecycle. **You MUST follow these workflows for any task execution:**
+This repository uses automated workflows for the development lifecycle. Use these via slash commands (e.g., `/repo-flow-manager`) or by describing the task:
 
-- **Requirement Entry:** Use `file:///.claude/skills/issue-manager/SKILL.md` (Trigger: "new requirement", "create issue").
-- **Task Execution:** Use `file:///.agents/workflows/repo-flow-manager.md` (Trigger: "start development", "claim issue").
-- **Quality Control:** Use `file:///.claude/skills/code-review/SKILL.md` (Trigger: "code review", "PR created").
-- **Orchestration:** Refer to `file:///.agents/workflows/master-flow.md` for the full pipeline logic.
+- **`/issue-manager`**: Create and refine GitHub Issues through conversation.
+- **`/repo-flow-manager`**: Full development cycle (Claim task -> Design -> Code -> Test -> PR).
+- **`/code-review`**: Perform automated quality checks on the current code or a PR.
+- **`/master-flow`**: Orchestrate the entire pipeline from requirement to PR.
 
-Before starting any task, check these files to ensure you follow the established engineering standards.
+Detailed workflow definitions are located in `.agents/workflows/`.
+
+## Development Standards
+
+### Testing Guidelines
+- **Mandatory Coverage**: All new features and bug fixes MUST include corresponding unit tests.
+- **Isolation**: Treat the unit as a black box. Use `AAA` (Arrange-Act-Assert) pattern.
+- **Mocks & Stubs**: Use test doubles for external systems (DB, Redis, ES, Kafka, MinIO).
+- **CRITICAL**: **NEVER** call real LLM/Embedding APIs (DashScope, DeepSeek) in unit tests. Use mocks.
+- **FIRST Principles**: Tests must be Fast, Independent, Repeatable, Self-validating, and Timely.
+
+### Pull Request Standards
+- **Readiness**: PRs should only be created if the branch has commits ahead of base and all tests pass.
+- **Documentation**: Technology plans should be saved in `docs/tech/ISSUE_<ID>_TECH_PLAN.md`.
+- **Commits**: Use conventional commits (e.g., `feat(ui): add search bar`, `fix(pipeline): handle large files`).
+- **Description**: PR body must clearly explain the "What" and "Why", and link to the relevant issue.
 
 ## Common Commands
 
