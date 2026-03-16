@@ -45,44 +45,6 @@ func (h *hostProxy) InvokableRun(ctx context.Context, input string, ...) (string
 }
 ```
 
-### 2.2 意图识别：从“死板匹配”到“模糊指令感知” ([tool_codegen_service.go](file:///c:/Users/songyipeng/Desktop/claude-project/rag/rag/internal/service/tool_codegen_service.go))
-
-#### ❌ 修改前 (极其僵硬)
-```go
-// 只有用户输入完全匹配数组词条时才会触发
-cnDirect := []string{"新增功能", "新建tool"}
-// 如果输入 "给我写一个搜索的功能" -> 匹配失败
-```
-
-#### ✅ 修改后 (组合关联识别)
-```go
-// 采用“动作 + 目标”双轮检测
-actions := []string{"创建", "新增", "开发", "写", "implement"}
-targets := []string{"tool", "工具", "功能", "插件"}
-
-for _, t := range targets {
-    if strings.Contains(query, t) {
-        for _, a := range actions {
-            if strings.Contains(query, a) { return true }
-        }
-    }
-}
-```
-
-### 2.3 规则管理：从“硬编码”到“技能驱动”
-
-#### ❌ 修改前
-`systemPrompt` 维护在 [tool_codegen_service.go](file:///c:/Users/songyipeng/Desktop/claude-project/rag/rag/internal/service/tool_codegen_service.go) 的变量里，每次修改规则都要重启后端。
-
-#### ✅ 修改后
-```go
-// 动态加载技能文件
-skillPath := "internal/agent/skills/tool_generation.md"
-skillContent, _ := os.ReadFile(skillPath)
-systemPrompt := "..." + string(skillContent)
-```
-**意义**：现在 [tool_generation.md](file:///c:/Users/songyipeng/Desktop/claude-project/rag/rag/internal/agent/skills/tool_generation.md) 成为了工具生成的“宪法”，修改该文件即可即时改变模型生成的代码行为。
-
 ---
 
 ## 3. 关键修复点 (Bug Hotfixes)
