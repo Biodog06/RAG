@@ -10,6 +10,7 @@ description: |
   Use proactively when user requests code review, quality check, or bug detection.
 
   Triggers: code review, review code, check code, analyze code, bug detection,
+  提交代码, 创建PR, 完成开发,
   코드 리뷰, 코드 검토, 버그 검사, コードレビュー, バグ検出, 代码审查, 代码检查,
   revisión de código, revisar código, detección de errores,
   revue de code, réviser le code, détection de bugs,
@@ -138,5 +139,10 @@ code-analyzer Agent uses confidence-based filtering:
 ## PDCA Integration
 
 - **Phase**: Check (Quality verification)
-- **Trigger**: Auto-suggested after implementation
+- **Trigger**: Auto-suggested after implementation or PR creation
 - **Output**: docs/03-analysis/code-review-{date}.md
+
+---
+**Pipeline Hooks**:
+- **Mid-stream Linkage**: 被 `repo-flow-manager` 在 PR 提交后自动激活。
+- **Auto-scan**: 处于常驻开启状态，准备扫描任何新的代码提交。

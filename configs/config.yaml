@@ -32,8 +32,9 @@ minio:
   use_ssl: false
   bucket_name: "uploads"
 
-tika:
-  server_url: "http://127.0.0.1:9998"
+mineru:
+  endpoint: "127.0.0.1:50051"
+  timeout: 60
 
 elasticsearch:
   addresses: "http://127.0.0.1:9200"

@@ -18,7 +18,7 @@ type Config struct {
 	JWT           JWTConfig           `mapstructure:"jwt"`
 	Log           LogConfig           `mapstructure:"log"`
 	Kafka         KafkaConfig         `mapstructure:"kafka"`
-	Tika          TikaConfig          `mapstructure:"tika"`
+	MinerU        MinerUConfig        `mapstructure:"mineru"`
 	Elasticsearch ElasticsearchConfig `mapstructure:"elasticsearch"`
 	MinIO         MinIOConfig         `mapstructure:"minio"`
 	Embedding     EmbeddingConfig     `mapstructure:"embedding"`
@@ -72,9 +72,10 @@ type KafkaConfig struct {
 	Topic   string `mapstructure:"topic"`
 }
 
-// TikaConfig 存储 Tika 服务器相关的配置。
-type TikaConfig struct {
-	ServerURL string `mapstructure:"server_url"`
+// MinerUConfig 存储 MinerU 服务器相关的配置。
+type MinerUConfig struct {
+	Endpoint string `mapstructure:"endpoint"`
+	Timeout  int    `mapstructure:"timeout"`
 }
 
 // ElasticsearchConfig 存储 Elasticsearch 相关的配置。

@@ -13,7 +13,15 @@ func main() {
 	log.Init(cfg.Log.Level, cfg.Log.Format, cfg.Log.OutputPath)
 	database.InitMySQL(cfg.Database.MySQL.DSN)
 
-	err := database.DB.AutoMigrate(&model.DocumentVector{})
+	err := database.DB.AutoMigrate(
+		&model.FileUpload{},
+		&model.ChunkInfo{},
+		&model.DocumentVector{},
+		&model.OrganizationTag{},
+		&model.User{},
+		&model.Conversation{},
+		&model.StructuredData{},
+	)
 	if err != nil {
 		panic(err)
 	}

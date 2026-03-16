@@ -25,7 +25,7 @@ import (
 	"pai-smart-go/pkg/log"
 	"pai-smart-go/pkg/rerank"
 	"pai-smart-go/pkg/storage"
-	"pai-smart-go/pkg/tika"
+	"pai-smart-go/pkg/mineru"
 	"pai-smart-go/pkg/token"
 	"path/filepath"
 	"syscall"
@@ -62,17 +62,25 @@ func main() {
 	uploadRepo := repository.NewUploadRepository(database.DB, database.RDB)
 	conversationRepo := repository.NewConversationRepository(database.RDB)
 	docVectorRepo := repository.NewDocumentVectorRepository(database.DB)
+	structuredDataRepo := repository.NewStructuredDataRepository(database.DB)
 
 	// 5. 初始化 Service (依赖注入)
 	jwtManager := token.NewJWTManager(cfg.JWT.Secret, cfg.JWT.AccessTokenExpireHours, cfg.JWT.RefreshTokenExpireDays)
-	tikaClient := tika.NewClient(cfg.Tika)
+	mineruClient, err := mineru.NewClient(mineru.Config{
+		Endpoint: cfg.MinerU.Endpoint,
+		Timeout:  time.Duration(cfg.MinerU.Timeout) * time.Second,
+	})
+	if err != nil {
+		log.Fatalf("初始化 MinerU 客户端失败: %v", err)
+	}
 	embeddingClient := embedding.NewClient(cfg.Embedding)
 	rerankClient := rerank.NewClient(cfg.Rerank) // 初始化 Rerank Client
 	llmClient := llm.NewClient(cfg.LLM)
+	excelService := service.NewExcelService(structuredDataRepo)
 	userService := service.NewUserService(userRepository, orgTagRepo, jwtManager)
 	adminService := service.NewAdminService(orgTagRepo, userRepository, conversationRepo)
 	uploadService := service.NewUploadService(uploadRepo, userRepository, cfg.MinIO)
-	documentService := service.NewDocumentService(uploadRepo, userRepository, orgTagRepo, cfg.MinIO, tikaClient)
+	documentService := service.NewDocumentService(uploadRepo, userRepository, orgTagRepo, cfg.MinIO, mineruClient)
 	// 初始化 Redis 客户端（用于检索结果缓存）
 	redisClient := redis.NewClient(&redis.Options{
 		Addr:     cfg.Database.Redis.Addr,
@@ -92,7 +100,8 @@ func main() {
 
 	// 6. 初始化文件处理管道 (Processor)
 	processor := pipeline.NewProcessor(
-		tikaClient,
+		mineruClient,
+		excelService,
 		embeddingClient,
 		cfg.Elasticsearch,
 		cfg.MinIO,

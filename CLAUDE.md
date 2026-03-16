@@ -11,10 +11,21 @@ PaiSmart (派聪明) is an enterprise-level AI knowledge base management system 
 - **Databases:** MySQL (metadata), Redis (caching + search result cache), Elasticsearch 8.10.0 (vector search)
 - **Message Queue:** Kafka (async document processing)
 - **Object Storage:** MinIO (file storage)
-- **Document Processing:** Apache Tika (text extraction)
+- **Document Processing:** MinerU (PDF/Doc/PPT intelligent extraction via gRPC), Excelize (Excel data engineering)
 - **AI Services:** DeepSeek/Ollama (LLM), Alibaba DashScope (embeddings), BGE/Jina/Cohere-compatible (rerank)
 - **Segmentation:** `go-ego/gse` (Chinese word segmentation, optional)
 - **Security:** JWT authentication, role-based authorization
+
+## Workflow Agents & Skills
+
+This repository uses a set of automated agents for its development lifecycle. **You MUST follow these workflows for any task execution:**
+
+- **Requirement Entry:** Use `file:///.claude/skills/issue-manager/SKILL.md` (Trigger: "new requirement", "create issue").
+- **Task Execution:** Use `file:///.agents/workflows/repo-flow-manager.md` (Trigger: "start development", "claim issue").
+- **Quality Control:** Use `file:///.claude/skills/code-review/SKILL.md` (Trigger: "code review", "PR created").
+- **Orchestration:** Refer to `file:///.agents/workflows/master-flow.md` for the full pipeline logic.
+
+Before starting any task, check these files to ensure you follow the established engineering standards.
 
 ## Common Commands
 
@@ -55,6 +66,8 @@ pnpm run typecheck    # Type checking
 pnpm run lint         # Lint and fix
 ```
 
+See [CI Guide](file:///docs/CI_GUIDE.md) for automated pipeline details.
+
 ### Docker & Infrastructure
 
 ```bash
@@ -80,8 +93,8 @@ docker-compose logs -f [service_name]
 
 **Processing (`pipeline.Processor` consumes Kafka):**
 1. Download file from MinIO (`merged/<filename>`)
-2. Extract text via Apache Tika
-3. Split text into chunks: **自适应策略** (Markdown 1500, Code 1200, Default 1000)
+2. Extract text via MinerU (PDF/Doc/PPT) or Excelize (XLSX, data engineering)
+3. Split text into chunks (if not Excel): **自适应策略** (Markdown 1500, Code 1200, Default 1000)
 4. Save chunks to MySQL `document_vector` table (idempotent)
 5. Generate embeddings via DashScope: **批量向量化** (10个/批次), **并发处理** (5个并发Worker)
 6. Index to Elasticsearch: **部分失败容错** (异常分块跳过不阻塞全文件)
@@ -171,6 +184,7 @@ Key settings beyond standard ones:
 ## Testing Requirements
 
 - **Mandatory Coverage**: All new features and bug fixes MUST include corresponding unit tests.
+- **No Real AI Calls**: Tests MUST NOT call real LLM/Embedding APIs (DashScope, etc.). Use mocks.
 - **Modified Code**: Any modification to existing code should update or add tests to maintain coverage.
 - **Go Tests**: Use `go test -v ./...` for backend verification.
 - **Frontend Tests**: Use `pnpm run typecheck` and ensure builds pass.

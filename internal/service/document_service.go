@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/minio/minio-go/v7"
-	"pai-smart-go/pkg/tika"
+	"pai-smart-go/pkg/mineru"
 )
 
 // FileUploadDTO 是一个数据传输对象，用于在返回给前端时隐藏一些字段并添加额外信息。
@@ -52,17 +52,17 @@ type documentService struct {
 	userRepo   repository.UserRepository
 	orgTagRepo repository.OrgTagRepository // 新增依赖
 	minioCfg   config.MinIOConfig
-	tikaClient *tika.Client // 新增依赖
+	mineruClient *mineru.Client // 替换 tikaClient
 }
 
 // NewDocumentService 创建一个新的 DocumentService 实例。
-func NewDocumentService(uploadRepo repository.UploadRepository, userRepo repository.UserRepository, orgTagRepo repository.OrgTagRepository, minioCfg config.MinIOConfig, tikaClient *tika.Client) DocumentService {
+func NewDocumentService(uploadRepo repository.UploadRepository, userRepo repository.UserRepository, orgTagRepo repository.OrgTagRepository, minioCfg config.MinIOConfig, mineruClient *mineru.Client) DocumentService {
 	return &documentService{
-		uploadRepo: uploadRepo,
-		userRepo:   userRepo,
-		orgTagRepo: orgTagRepo,
-		minioCfg:   minioCfg,
-		tikaClient: tikaClient,
+		uploadRepo:   uploadRepo,
+		userRepo:     userRepo,
+		orgTagRepo:   orgTagRepo,
+		minioCfg:     minioCfg,
+		mineruClient: mineruClient,
 	}
 }
 
@@ -195,12 +195,14 @@ func (s *documentService) GetFilePreviewContent(fileName string, user *model.Use
 	}
 	defer object.Close()
 
-	// 对于 .md 和 .txt 文件，直接读取原始内容，不经过 Tika (避免丢失 Markdown 格式)
+	// 提前读入内存以便处理
+	contentBytes, err := io.ReadAll(object)
+	if err != nil {
+		return nil, err
+	}
+
+	// 对于 .md 和 .txt 文件，直接读取原始内容，不经过 MinerU
 	if strings.HasSuffix(strings.ToLower(fileName), ".md") || strings.HasSuffix(strings.ToLower(fileName), ".txt") {
-		contentBytes, err := io.ReadAll(object)
-		if err != nil {
-			return nil, err
-		}
 		return &PreviewInfoDTO{
 			FileName: targetFile.FileName,
 			Content:  string(contentBytes),
@@ -208,8 +210,8 @@ func (s *documentService) GetFilePreviewContent(fileName string, user *model.Use
 		}, nil
 	}
 
-	// 其他文件类型将文件流发送给 Tika 进行文本提取
-	content, err := s.tikaClient.ExtractText(object, fileName)
+	// 其他文件类型将文件流发送给 MinerU 进行智能文本提取 (PDF, DOCX等)
+	content, err := s.mineruClient.Parse(context.Background(), fileName, contentBytes)
 	if err != nil {
 		return nil, err
 	}

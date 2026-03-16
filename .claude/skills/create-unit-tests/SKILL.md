@@ -22,7 +22,8 @@ Produce deterministic, maintainable unit tests that verify one observable behavi
 - The skill MUST NOT mock the subject under test.
 - The skill SHOULD avoid mock overuse and weak interaction-only tests when outcome assertions can express the behavior more directly.
 - The skill SHOULD keep test data readable, minimal, and local where practical.
-- The skill SHOULD organize tests so affected tests are easy to locate from the changed production code, usually by following the surrounding project structure or convention.
+- The skill MUST organize tests so affected tests are easy to locate from the changed production code, usually by following the surrounding project structure or convention.
+- **CRITICAL RULE**: The skill MUST NOT make real network calls to LLMs or external APIs (e.g., DashScope, DeepSeek) during unit tests. All AI service interactions MUST be mocked or stubbed.
 - The skill MUST avoid coupling to implementation details (private methods, internal call order unless order is contractually required, incidental data structures).
 
 ## Workflow

@@ -19,7 +19,9 @@ import (
 	"pai-smart-go/pkg/log"
 	"pai-smart-go/pkg/storage"
 	"pai-smart-go/pkg/tasks"
-	"pai-smart-go/pkg/tika"
+	"pai-smart-go/pkg/mineru"
+	"pai-smart-go/internal/service"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 )
@@ -54,6 +56,7 @@ func main() {
 	userRepo := repository.NewUserRepository(database.DB)
 	uploadRepo := repository.NewUploadRepository(database.DB, database.RDB)
 	docRepo := repository.NewDocumentVectorRepository(database.DB)
+	structuredDataRepo := repository.NewStructuredDataRepository(database.DB)
 
 	// 4. Get User
 	user, err := userRepo.FindByUsername(*userPtr)
@@ -63,9 +66,15 @@ func main() {
 
 	// 5. Init Processor
 	embeddingClient := embedding.NewClient(cfg.Embedding)
-	tikaClient := tika.NewClient(cfg.Tika)
+	mineruClient, _ := mineru.NewClient(mineru.Config{
+		Endpoint: cfg.MinerU.Endpoint,
+		Timeout:  time.Duration(cfg.MinerU.Timeout) * time.Second,
+	})
+	excelSvc := service.NewExcelService(structuredDataRepo)
+
 	processor := pipeline.NewProcessor(
-		tikaClient,
+		mineruClient,
+		excelSvc,
 		embeddingClient,
 		cfg.Elasticsearch,
 		cfg.MinIO,

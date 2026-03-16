@@ -15,7 +15,8 @@ import (
 	"pai-smart-go/pkg/splitter"
 	"pai-smart-go/pkg/storage"
 	"pai-smart-go/pkg/tasks"
-	"pai-smart-go/pkg/tika"
+	"pai-smart-go/pkg/mineru"
+	"pai-smart-go/internal/service"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -34,7 +35,8 @@ const (
 
 // Processor 封装了文件处理的所有依赖和逻辑。
 type Processor struct {
-	tikaClient      *tika.Client
+	mineruClient    *mineru.Client
+	excelSvc        service.ExcelService
 	embeddingClient embedding.Client
 	esCfg           config.ElasticsearchConfig
 	minioCfg        config.MinIOConfig
@@ -45,7 +47,8 @@ type Processor struct {
 
 // NewProcessor 创建一个新的 Processor 实例。
 func NewProcessor(
-	tikaClient *tika.Client,
+	mineruClient *mineru.Client,
+	excelSvc service.ExcelService,
 	embeddingClient embedding.Client,
 	esCfg config.ElasticsearchConfig,
 	minioCfg config.MinIOConfig,
@@ -54,7 +57,8 @@ func NewProcessor(
 	docVectorRepo repository.DocumentVectorRepository,
 ) *Processor {
 	return &Processor{
-		tikaClient:      tikaClient,
+		mineruClient:    mineruClient,
+		excelSvc:        excelSvc,
 		embeddingClient: embeddingClient,
 		esCfg:           esCfg,
 		minioCfg:        minioCfg,
@@ -92,18 +96,38 @@ func (p *Processor) Process(ctx context.Context, task tasks.FileProcessingTask) 
 		return errors.New("文件内容为空")
 	}
 
-	// 2. 使用 Tika 提取文本 (使用缓冲区中的数据)
-	log.Info("[Processor] 步骤2: 使用Tika提取文本内容")
-	textContent, err := p.tikaClient.ExtractText(bytes.NewReader(buf.Bytes()), task.FileName)
-	if err != nil {
-		log.Errorf("[Processor] 使用Tika提取文本失败, FileName: %s, Error: %v", task.FileName, err)
-		return fmt.Errorf("使用 Tika 提取文本失败: %w", err)
+	// 2. 根据文件类型选择解析引擎
+	ext := strings.ToLower(filepath.Ext(task.FileName))
+	var textContent string
+
+	if isExcelFile(ext) {
+		log.Infof("[Processor] 步骤2: 检测到 Excel 文件, 进入数据工程管线: %s", task.FileName)
+		if err := p.excelSvc.ProcessExcel(bytes.NewReader(buf.Bytes()), task.FileMD5); err != nil {
+			log.Errorf("[Processor] Excel 数据工程处理失败, FileName: %s, Error: %v", task.FileName, err)
+			return fmt.Errorf("Excel 数据工程处理失败: %w", err)
+		}
+		log.Infof("[Processor] 步骤2: Excel 数据导入完成, FileName: %s. 注意: 结构化数据不进入向量检索流程。", task.FileName)
+		return nil // Excel 处理完直接返回，不走向量化切块流程
 	}
+
+	if isSmartDocFile(ext) {
+		log.Infof("[Processor] 步骤2: 使用 MinerU (gRPC) 提取 PDF/Doc/PPT 文本内容")
+		content, err := p.mineruClient.Parse(ctx, task.FileName, buf.Bytes())
+		if err != nil {
+			log.Errorf("[Processor] 使用 MinerU 提取文本失败, FileName: %s, Error: %v", task.FileName, err)
+			return fmt.Errorf("使用 MinerU 提取文本失败: %w", err)
+		}
+		textContent = content
+	} else {
+		log.Infof("[Processor] 步骤2: 使用原生方式读取 TXT/MD/Code 内容")
+		textContent = string(buf.Bytes())
+	}
+
 	if textContent == "" {
-		log.Warnf("[Processor] Tika提取的文本内容为空, 处理中止, FileName: %s", task.FileName)
+		log.Warnf("[Processor] 提取的文本内容为空, 处理中止, FileName: %s", task.FileName)
 		return errors.New("提取的文本内容为空")
 	}
-	log.Infof("[Processor] 步骤2: 文本提取成功, 内容长度: %d 字符", utf8.RuneCountInString(textContent))
+	log.Infof("[Processor] 步骤2: 文本解析成功, 内容长度: %d 字符", utf8.RuneCountInString(textContent))
 
 	// 3. 自适应文本切块 —— 根据文件类型选择最优分块策略
 	chunkSize, chunkOverlap := p.selectChunkParams(task.FileName)
@@ -365,4 +389,19 @@ func isCodeFile(fileName string) bool {
 		".php": true, ".rb": true, ".rs": true, ".sh": true, ".sql": true,
 	}
 	return codeExts[ext]
+}
+// isSmartDocFile 判断是否为 MinerU 擅长处理的“智能文档”类型
+func isSmartDocFile(ext string) bool {
+	exts := map[string]bool{
+		".pdf": true, ".docx": true, ".doc": true, ".pptx": true, ".ppt": true,
+	}
+	return exts[ext]
+}
+
+// isExcelFile 判断是否为表格数据类型
+func isExcelFile(ext string) bool {
+	exts := map[string]bool{
+		".xlsx": true, ".xls": true, ".csv": true,
+	}
+	return exts[ext]
 }
