@@ -33,11 +33,9 @@ description: Issue Manager Agent - 通过对话快速创建并推送 GitHub Issu
   ```
 
 ### 3. 推送至 GitHub (Pusing)
-- **操作**:
-- **推荐操作**: 为了确保 Markdown 格式完美呈现（尤其是代码块和列表），建议先将 Body 内容保存为临时 `.md` 文件，并使用 `--body-file` 参数：
+- **操作**: 为了确保 Markdown 格式完美呈现（尤其是代码块和列表），建议先将 Body 内容保存为临时 `.md` 文件，并使用 `--body-file` 参数：
   `gh issue create --title "<Title>" --body-file "temp_body.md" --label "<Labels>"`。
-- **直接命令 (仅适用简单内容)**: `gh issue create --title "<Title>" --body "<Body>"`。
-  - 获取并返回生成的 Issue 链接和编号给用户。
+- **issue 格式**: 参考 .claude\skills\github-issue-creator 中的skill。
 
 ### 4. 任务联通 (Handoff)
 - **操作**: 告知用户任务已就绪。
