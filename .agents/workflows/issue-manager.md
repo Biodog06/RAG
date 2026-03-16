@@ -34,7 +34,9 @@ description: Issue Manager Agent - 通过对话快速创建并推送 GitHub Issu
 
 ### 3. 推送至 GitHub (Pusing)
 - **操作**:
-- **运行命令**: `gh issue create --title "<Title>" --body "<Body>" --label "<Labels>"`。
+- **推荐操作**: 为了确保 Markdown 格式完美呈现（尤其是代码块和列表），建议先将 Body 内容保存为临时 `.md` 文件，并使用 `--body-file` 参数：
+  `gh issue create --title "<Title>" --body-file "temp_body.md" --label "<Labels>"`。
+- **直接命令 (仅适用简单内容)**: `gh issue create --title "<Title>" --body "<Body>"`。
   - 获取并返回生成的 Issue 链接和编号给用户。
 
 ### 4. 任务联通 (Handoff)
@@ -49,3 +51,5 @@ description: Issue Manager Agent - 通过对话快速创建并推送 GitHub Issu
 ## 注意事项
 - 尽量通过简短的追问获取高质量的验收标准。
 - 确保 Issue 标题简洁且专业。
+- **格式维护**: 必须确保在 GitHub 呈现的内容是标准的 Markdown 格式。若内容包含代码块或复杂列表，**严禁**直接通过命令行字符串拼接，必须使用临时文件 (`--body-file`)。
+- **编码提示**: 在 Windows 系统下生成临时文件时，需显式指定 `utf8` 编码（如 PowerShell 的 `Out-File -Encoding utf8`），防止中文显示为乱码。

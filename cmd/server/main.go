@@ -54,6 +54,12 @@ func main() {
 		log.Errorf("es 初始化失败 %s", err)
 		return
 	}
+	if err := database.InitNeo4j(cfg.Database.Neo4j); err != nil {
+		log.Errorf("Neo4j 初始化失败 %s", err)
+		// 暂时不作为致命错误，允许程序在无图数据库时运行（降级）
+	}
+	defer database.CloseNeo4j()
+
 	kafka.InitProducer(cfg.Kafka)
 
 	// 4. 初始化 Repository
@@ -98,6 +104,10 @@ func main() {
 	conversationService := service.NewConversationService(conversationRepo)
 	chatService := service.NewChatService(searchService, llmClient, conversationRepo, cacheService, embeddingClient)
 
+	// 图增强对话服务初始化
+	graphSearchService := service.NewGraphSearchService(llmClient)
+	graphChatService := service.NewGraphChatService(searchService, graphSearchService, llmClient, conversationRepo, cacheService, embeddingClient)
+
 	// 6. 初始化文件处理管道 (Processor)
 	processor := pipeline.NewProcessor(
 		mineruClient,
@@ -108,6 +118,7 @@ func main() {
 		cfg.Embedding,
 		uploadRepo,
 		docVectorRepo,
+		llmClient,
 	)
 
 	// 7. 启动后台 Kafka 消费者
@@ -197,8 +208,11 @@ func main() {
 		chatGroup := apiV1.Group("/chat")
 		{
 			chatGroup.GET("/websocket-token", handler.NewChatHandler(chatService, userService, jwtManager).GetWebsocketStopToken)
+			// 图增强版本获取 token (复用即可，或者根据需要区分)
+			chatGroup.GET("/graph/websocket-token", handler.NewChatHandler(graphChatService, userService, jwtManager).GetWebsocketStopToken)
 		}
 		r.GET("/chat/:token", handler.NewChatHandler(chatService, userService, jwtManager).Handle)
+		r.GET("/chat/graph/:token", handler.NewChatHandler(graphChatService, userService, jwtManager).Handle)
 
 		admin := apiV1.Group("/admin")
 		// 管理员路由组，需要同时通过认证和管理员授权两个中间件

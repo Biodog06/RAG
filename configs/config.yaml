@@ -9,6 +9,10 @@ database:
     addr: "127.0.0.1:6380"
     password: "PaiSmart2025"
     db: 0
+  neo4j:
+    uri: "bolt://127.0.0.1:7687"
+    username: "neo4j"
+    password: "password"
 
 jwt:
   secret: "PXrQbuCwXwOZzkML/Vm2S5rSwt1iybvmKtGDzVEu+Hc="

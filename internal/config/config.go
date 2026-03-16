@@ -38,6 +38,7 @@ type ServerConfig struct {
 type DatabaseConfig struct {
 	MySQL MySQLConfig `mapstructure:"mysql"`
 	Redis RedisConfig `mapstructure:"redis"`
+	Neo4j Neo4jConfig `mapstructure:"neo4j"`
 }
 
 // MySQLConfig 存储 MySQL 数据库的配置。
@@ -50,6 +51,13 @@ type RedisConfig struct {
 	Addr     string `mapstructure:"addr"`
 	Password string `mapstructure:"password"`
 	DB       int    `mapstructure:"db"`
+}
+
+// Neo4jConfig 存储 Neo4j 的配置。
+type Neo4jConfig struct {
+	URI      string `mapstructure:"uri"`
+	Username string `mapstructure:"username"`
+	Password string `mapstructure:"password"`
 }
 
 // JWTConfig 存储 JWT 相关的配置。
