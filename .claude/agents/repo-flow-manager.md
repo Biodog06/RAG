@@ -1,7 +1,3 @@
----
-description: Repo Flow Manager - 自动化的 GitHub 任务处理流程（领取→方案→实现→测试→PR）
----
-
 # Repo Flow Manager 自动化流程规范
 
 本工作流用于指导 Claude 在 GitHub 仓库中执行全自动化的工程交付。

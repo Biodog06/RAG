@@ -21,6 +21,7 @@ import (
 	"pai-smart-go/pkg/tasks"
 	"pai-smart-go/pkg/mineru"
 	"pai-smart-go/internal/service"
+	"pai-smart-go/pkg/llm"
 	"time"
 
 	"github.com/minio/minio-go/v7"
@@ -66,6 +67,7 @@ func main() {
 
 	// 5. Init Processor
 	embeddingClient := embedding.NewClient(cfg.Embedding)
+	llmClient := llm.NewClient(cfg.LLM)
 	mineruClient, _ := mineru.NewClient(mineru.Config{
 		Endpoint: cfg.MinerU.Endpoint,
 		Timeout:  time.Duration(cfg.MinerU.Timeout) * time.Second,
@@ -81,6 +83,7 @@ func main() {
 		cfg.Embedding,
 		uploadRepo,
 		docRepo,
+		llmClient,
 	)
 
 	// 6. Scan Directory
