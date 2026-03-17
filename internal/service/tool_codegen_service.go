@@ -49,6 +49,22 @@ func (s *chatService) tryHandleToolGeneration(ctx context.Context, query string,
 		return false, nil
 	}
 
+	// Digital Guardrail: Only ADMINs can trigger tool generation
+	if user.Role != "ADMIN" {
+		log.Warnf("[ToolCodegen] Unauthorized tool generation attempt by user: %s (ID: %d)", user.Username, user.ID)
+		_ = writer.WriteMessage(websocket.TextMessage, []byte("抱歉，工具自动编写功能目前仅对管理员开放。"))
+		sendCompletion(writer.conn)
+		return true, nil
+	}
+
+	// Digital Guardrail: Input validation for safety
+	if err := validateRequirement(query); err != nil {
+		log.Warnf("[ToolCodegen] Blocked suspicious tool generation request from user %s: %v", user.Username, err)
+		_ = writer.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("抱歉，您的需求包含不安全的操作或超出范围: %v", err)))
+		sendCompletion(writer.conn)
+		return true, nil
+	}
+
 	result, err := s.generateToolFileFromRequest(ctx, query)
 	if err != nil {
 		msg := fmt.Sprintf("tool 代码生成失败: %v", err)
@@ -92,7 +108,15 @@ func GenerateToolCodeFromUserInput(ctx context.Context, llmClient llm.Client, re
 func generateToolFileFromRequest(ctx context.Context, llmClient llm.Client, requirement string) (*generatedToolResult, error) {
 	skillPath := "internal/agent/skills/tool_generation.md"
 	skillContent, err := os.ReadFile(skillPath)
-	systemPrompt := `你是一个Go工程代码生成器。请根据用户需求生成一个可编译的 Eino Tool Go 文件。`
+	systemPrompt := `你是一个专业且安全的 Go 工程代码生成器。请根据用户需求生成一个可编译、高性能且符合安全规范的 Eino Tool Go 文件。
+
+【核心安全原则】：
+1. 禁止生成任何可能执行任意系统命令的代码（如 exec.Command）。
+2. 禁止生成任何可能损坏系统、修改磁盘核心文件或数据库结构的逻辑。
+3. 生成的代码必须包含对输入参数的基本边界检查和错误处理。
+4. 禁止在代码中包含硬编码的敏感信息（如 API Key、密码等）。
+5. 逻辑应当保持简洁、清晰且职责单一。`
+
 	if err == nil {
 		systemPrompt += "\n\n请严格遵守以下【工具生成规范】：\n" + string(skillContent)
 	}
@@ -204,6 +228,32 @@ func isToolGenerationIntent(query string) bool {
 	}
 
 	return false
+}
+
+func validateRequirement(requirement string) error {
+	req := strings.ToLower(requirement)
+
+	// 1. Dangerous keywords or patterns
+	forbiddenPatterns := []string{
+		"rm -rf", "delete all", "drop table", "drop database", "truncate table",
+		"format c:", "os.removeall", "exec.command", "os/exec",
+		"eval(", "panic(", "unsafe.", "reflect.set",
+		"steal", "hack", "malware", "virus", "backdoor",
+		"binary.write", "syscall",
+	}
+
+	for _, pattern := range forbiddenPatterns {
+		if strings.Contains(req, pattern) {
+			return fmt.Errorf("检测到可能危险或越权的操作描述: %s", pattern)
+		}
+	}
+
+	// 2. Length check to prevent prompt injection or OOM
+	if len(requirement) > 1000 {
+		return fmt.Errorf("需求描述过长，请尝试将其拆分为更小的任务")
+	}
+
+	return nil
 }
 
 func extractFirstJSONObject(raw string) (string, error) {
