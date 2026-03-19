@@ -13,6 +13,7 @@ import (
 	"pai-smart-go/internal/model"
 	"pai-smart-go/pkg/log"
 	"strings"
+	"time"
 
 	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/elastic/go-elasticsearch/v8/esapi"
@@ -21,13 +22,19 @@ import (
 var ESClient *elasticsearch.Client
 
 // InitES 初始化 Elasticsearch 客户端
+// 优化：配置连接池、自动重试与超时控制。
 func InitES(esCfg config.ElasticsearchConfig) error {
 	cfg := elasticsearch.Config{
-		Addresses: []string{esCfg.Addresses},
-		Username:  esCfg.Username,
-		Password:  esCfg.Password,
+		Addresses:     []string{esCfg.Addresses},
+		Username:      esCfg.Username,
+		Password:      esCfg.Password,
+		MaxRetries:    3,                         // 自动重试 3 次
+		RetryOnStatus: []int{502, 503, 504},      // 仅在网关/服务不可用时重试
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			MaxIdleConns:        10,               // 连接池：最大空闲连接数
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second, // 空闲连接超时
 		},
 	}
 	client, err := elasticsearch.NewClient(cfg)
@@ -35,6 +42,7 @@ func InitES(esCfg config.ElasticsearchConfig) error {
 		return err
 	}
 	ESClient = client
+	log.Info("[ES] Elasticsearch 客户端初始化成功 (连接池+重试已启用)")
 	return createIndexIfNotExists(esCfg.IndexName)
 }
 
@@ -63,6 +71,7 @@ func createIndexIfNotExists(indexName string) error {
 			"properties": {
 				"vector_id": { "type": "keyword" },
 				"file_md5": { "type": "keyword" },
+				"file_name": { "type": "keyword" },
 				"chunk_id": { "type": "integer" },
 				"text_content": { 
 					"type": "text",
@@ -124,6 +133,40 @@ func IndexDocument(ctx context.Context, indexName string, doc model.EsDocument) 
 	if res.IsError() {
 		log.Errorf("索引文档到 Elasticsearch 出错: %s", res.String())
 		return errors.New("failed to index document")
+	}
+
+	return nil
+}
+
+// DeleteByFileMD5 从 Elasticsearch 中删除指定 MD5 的所有文档。
+func DeleteByFileMD5(ctx context.Context, indexName string, fileMD5 string) error {
+	queryBody := map[string]interface{}{
+		"query": map[string]interface{}{
+			"term": map[string]interface{}{
+				"file_md5": fileMD5,
+			},
+		},
+	}
+
+	docBytes, err := json.Marshal(queryBody)
+	if err != nil {
+		return err
+	}
+
+	req := esapi.DeleteByQueryRequest{
+		Index: []string{indexName},
+		Body:  bytes.NewReader(docBytes),
+	}
+
+	res, err := req.Do(ctx, ESClient)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.IsError() {
+		log.Errorf("从 Elasticsearch 删除文档出错: %s", res.String())
+		return errors.New("failed to delete documents from es")
 	}
 
 	return nil

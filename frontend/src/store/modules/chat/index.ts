@@ -5,6 +5,8 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
   const input = ref<Api.Chat.Input>({ message: '' });
 
   const list = ref<Api.Chat.Message[]>([]);
+  const previewVisible = ref(false);
+  const previewFileName = ref('');
 
   const store = useAuthStore();
 
@@ -29,6 +31,8 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
     wsSend,
     wsOpen,
     wsClose,
-    scrollToBottom
+    scrollToBottom,
+    previewVisible,
+    previewFileName
   };
 });

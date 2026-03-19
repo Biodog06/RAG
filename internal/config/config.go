@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -17,13 +18,15 @@ type Config struct {
 	JWT           JWTConfig           `mapstructure:"jwt"`
 	Log           LogConfig           `mapstructure:"log"`
 	Kafka         KafkaConfig         `mapstructure:"kafka"`
-	Tika          TikaConfig          `mapstructure:"tika"`
+	MinerU        MinerUConfig        `mapstructure:"mineru"`
 	Elasticsearch ElasticsearchConfig `mapstructure:"elasticsearch"`
 	MinIO         MinIOConfig         `mapstructure:"minio"`
 	Embedding     EmbeddingConfig     `mapstructure:"embedding"`
 	LLM           LLMConfig           `mapstructure:"llm"`
 	AI            AIConfig            `mapstructure:"ai"`
 	Search        SearchConfig        `mapstructure:"search"`
+	Rerank        RerankConfig        `mapstructure:"rerank"`
+	Segmenter     SegmenterConfig     `mapstructure:"segmenter"`
 }
 
 // ServerConfig 存储服务器相关的配置。
@@ -36,6 +39,7 @@ type ServerConfig struct {
 type DatabaseConfig struct {
 	MySQL MySQLConfig `mapstructure:"mysql"`
 	Redis RedisConfig `mapstructure:"redis"`
+	Neo4j Neo4jConfig `mapstructure:"neo4j"`
 }
 
 // MySQLConfig 存储 MySQL 数据库的配置。
@@ -48,6 +52,13 @@ type RedisConfig struct {
 	Addr     string `mapstructure:"addr"`
 	Password string `mapstructure:"password"`
 	DB       int    `mapstructure:"db"`
+}
+
+// Neo4jConfig 存储 Neo4j 的配置。
+type Neo4jConfig struct {
+	URI      string `mapstructure:"uri"`
+	Username string `mapstructure:"username"`
+	Password string `mapstructure:"password"`
 }
 
 // JWTConfig 存储 JWT 相关的配置。
@@ -70,9 +81,10 @@ type KafkaConfig struct {
 	Topic   string `mapstructure:"topic"`
 }
 
-// TikaConfig 存储 Tika 服务器相关的配置。
-type TikaConfig struct {
-	ServerURL string `mapstructure:"server_url"`
+// MinerUConfig 存储 MinerU 服务器相关的配置。
+type MinerUConfig struct {
+	Endpoint string `mapstructure:"endpoint"`
+	Timeout  int    `mapstructure:"timeout"`
 }
 
 // ElasticsearchConfig 存储 Elasticsearch 相关的配置。
@@ -98,6 +110,15 @@ type EmbeddingConfig struct {
 	BaseURL    string `mapstructure:"base_url"`
 	Model      string `mapstructure:"model"`
 	Dimensions int    `mapstructure:"dimensions"`
+}
+
+// RerankConfig 存储 Rerank 模型相关的配置。
+type RerankConfig struct {
+	Enable   bool    `mapstructure:"enable"`
+	APIKey   string  `mapstructure:"api_key"`
+	BaseURL  string  `mapstructure:"base_url"`
+	Model    string  `mapstructure:"model"`
+	MinScore float64 `mapstructure:"min_score"`
 }
 
 // LLMConfig 存储大语言模型相关的配置。
@@ -149,10 +170,21 @@ type SearchConfig struct {
 	SpeculativeTimeoutMS int     `mapstructure:"speculative_timeout_ms"`
 }
 
+// SegmenterConfig 存储分词器相关的配置
+type SegmenterConfig struct {
+	Enabled bool   `mapstructure:"enabled"` // 是否启用分词器
+	Dict    string `mapstructure:"dict"`    // 自定义词典路径（可选）
+}
+
 // Init 初始化配置加载，从指定的路径读取 YAML 文件并解析到 Conf 变量中。
 func Init(configPath string) {
 	viper.SetConfigFile(configPath)
 	viper.SetConfigType("yaml")
+
+	// 启用环境变量读取
+	viper.AutomaticEnv()
+	// 允许使用 _ 替换 . (例如：SERVER_PORT 对应 server.port)
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	if err := viper.ReadInConfig(); err != nil {
 		panic(fmt.Errorf("读取配置文件失败: %w", err))

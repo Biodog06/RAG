@@ -3,10 +3,12 @@ package middleware
 
 import (
 	"bytes"
-	"github.com/gin-gonic/gin"
-	"io/ioutil"
-	"pai-smart-go/pkg/log"
+	"io"
+	"regexp"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"pai-smart-go/pkg/log"
 )
 
 // bodyLogWriter 用于捕获响应体
@@ -30,10 +32,10 @@ func RequestLogger() gin.HandlerFunc {
 		// 读取并重新缓存请求体
 		var requestBody []byte
 		if c.Request.Body != nil {
-			requestBody, _ = ioutil.ReadAll(c.Request.Body)
+			requestBody, _ = io.ReadAll(c.Request.Body)
 		}
 		// 将读取的请求体重新设置回 c.Request.Body，以便后续处理函数可以正常读取
-		c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(requestBody))
+		c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
 
 		// 使用自定义的 ResponseWriter 捕获响应
 		blw := &bodyLogWriter{body: bytes.NewBufferString(""), ResponseWriter: c.Writer}
@@ -49,6 +51,10 @@ func RequestLogger() gin.HandlerFunc {
 		method := c.Request.Method
 		path := c.Request.URL.Path
 
+		// 对日志内容进行敏感信息脱敏
+		sanitizedReq := sanitizeLog(string(requestBody))
+		sanitizedResp := sanitizeLog(blw.body.String())
+
 		// 记录完整的请求和响应信息
 		log.Infow("HTTP Request Log",
 			"statusCode", statusCode,
@@ -56,8 +62,19 @@ func RequestLogger() gin.HandlerFunc {
 			"clientIP", clientIP,
 			"method", method,
 			"path", path,
-			"requestBody", string(requestBody),
-			"responseBody", blw.body.String(),
+			"requestBody", sanitizedReq,
+			"responseBody", sanitizedResp,
 		)
 	}
 }
+
+// sanitizeLog 对日志中的敏感字段进行脱敏（如 token, password, secret）。
+func sanitizeLog(msg string) string {
+	if msg == "" {
+		return ""
+	}
+	// 正则匹配敏感字段，替换其值为 ***
+	re := regexp.MustCompile(`("?token"?|"?password"?|"?secret"?)[:=]\s*"?([^"&\s,{}]+)"?`)
+	return re.ReplaceAllString(msg, `$1:***`)
+}
+

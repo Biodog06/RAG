@@ -5,8 +5,9 @@ package model
 type DocumentVector struct {
 	VectorID     uint   `gorm:"primaryKey;autoIncrement;column:vector_id"`
 	FileMD5      string `gorm:"type:varchar(32);not null;index;column:file_md5"`
-	ChunkID      int    `gorm:"not null;column:chunk_id"`
-	TextContent  string `gorm:"type:text;column:text_content"`
+	ChunkID      int    `gorm:"column:chunk_id;not null"`
+	FileName     string `gorm:"column:file_name"` // 新增：保存原始文件名
+	TextContent  string `gorm:"type:longtext;column:text_content"`
 	ModelVersion string `gorm:"type:varchar(50);column:model_version"`
 	UserID       uint   `gorm:"not null;column:user_id"`
 	OrgTag       string `gorm:"type:varchar(50);column:org_tag"`

@@ -23,14 +23,16 @@ import (
 	"pai-smart-go/pkg/kafka"
 	"pai-smart-go/pkg/llm"
 	"pai-smart-go/pkg/log"
+	"pai-smart-go/pkg/rerank"
 	"pai-smart-go/pkg/storage"
-	"pai-smart-go/pkg/tika"
+	"pai-smart-go/pkg/mineru"
 	"pai-smart-go/pkg/token"
 	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 )
 
 func main() {
@@ -52,6 +54,12 @@ func main() {
 		log.Errorf("es 初始化失败 %s", err)
 		return
 	}
+	if err := database.InitNeo4j(cfg.Database.Neo4j); err != nil {
+		log.Errorf("Neo4j 初始化失败 %s", err)
+		// 暂时不作为致命错误，允许程序在无图数据库时运行（降级）
+	}
+	defer database.CloseNeo4j()
+
 	kafka.InitProducer(cfg.Kafka)
 
 	// 4. 初始化 Repository
@@ -60,29 +68,58 @@ func main() {
 	uploadRepo := repository.NewUploadRepository(database.DB, database.RDB)
 	conversationRepo := repository.NewConversationRepository(database.RDB)
 	docVectorRepo := repository.NewDocumentVectorRepository(database.DB)
+	structuredDataRepo := repository.NewStructuredDataRepository(database.DB)
 
 	// 5. 初始化 Service (依赖注入)
 	jwtManager := token.NewJWTManager(cfg.JWT.Secret, cfg.JWT.AccessTokenExpireHours, cfg.JWT.RefreshTokenExpireDays)
-	tikaClient := tika.NewClient(cfg.Tika)
+	mineruClient, err := mineru.NewClient(mineru.Config{
+		Endpoint: cfg.MinerU.Endpoint,
+		Timeout:  time.Duration(cfg.MinerU.Timeout) * time.Second,
+	})
+	if err != nil {
+		log.Fatalf("初始化 MinerU 客户端失败: %v", err)
+	}
 	embeddingClient := embedding.NewClient(cfg.Embedding)
+	rerankClient := rerank.NewClient(cfg.Rerank) // 初始化 Rerank Client
 	llmClient := llm.NewClient(cfg.LLM)
+	excelService := service.NewExcelService(structuredDataRepo)
 	userService := service.NewUserService(userRepository, orgTagRepo, jwtManager)
 	adminService := service.NewAdminService(orgTagRepo, userRepository, conversationRepo)
 	uploadService := service.NewUploadService(uploadRepo, userRepository, cfg.MinIO)
-	documentService := service.NewDocumentService(uploadRepo, userRepository, orgTagRepo, cfg.MinIO, tikaClient)
-	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo, llmClient)
+	documentService := service.NewDocumentService(uploadRepo, userRepository, orgTagRepo, cfg.MinIO, mineruClient)
+	// 初始化 Redis 客户端（用于检索结果缓存）
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     cfg.Database.Redis.Addr,
+		Password: cfg.Database.Redis.Password,
+		DB:       cfg.Database.Redis.DB,
+	})
+
+	// 初始化语义缓存服务
+	cacheService := service.NewContentCacheService(
+		service.WithRedisClient(redisClient),
+		service.WithEmbeddingClient(embeddingClient),
+	)
+
+	searchService := service.NewSearchService(embeddingClient, es.ESClient, userService, uploadRepo, rerankClient, llmClient, cfg.Segmenter, redisClient)
+
 	conversationService := service.NewConversationService(conversationRepo)
-	chatService := service.NewChatService(searchService, llmClient, conversationRepo)
+	chatService := service.NewChatService(searchService, llmClient, conversationRepo, cacheService, embeddingClient)
+
+	// 图增强对话服务初始化
+	graphSearchService := service.NewGraphSearchService(llmClient)
+	graphChatService := service.NewGraphChatService(searchService, graphSearchService, llmClient, conversationRepo, cacheService, embeddingClient)
 
 	// 6. 初始化文件处理管道 (Processor)
 	processor := pipeline.NewProcessor(
-		tikaClient,
+		mineruClient,
+		excelService,
 		embeddingClient,
 		cfg.Elasticsearch,
 		cfg.MinIO,
 		cfg.Embedding,
 		uploadRepo,
 		docVectorRepo,
+		llmClient,
 	)
 
 	// 7. 启动后台 Kafka 消费者
@@ -96,8 +133,12 @@ func main() {
 	// 8. 设置 Gin 模式并创建路由引擎
 	gin.SetMode(cfg.Server.Mode)
 	r := gin.New() // 使用 New() 创建一个不带默认中间件的引擎
-	// 添加我们自定义的日志中间件和 Gin 的 Recovery 中间件
-	r.Use(middleware.RequestLogger(), gin.Recovery())
+
+	// 初始化限流器 (例如：每秒 10 个请求，桶大小 20)
+	limiter := middleware.NewRateLimiter(10, 20)
+
+	// 添加中间件：日志、恢复、限流
+	r.Use(middleware.RequestLogger(), gin.Recovery(), limiter.Handler())
 
 	// 9. 注册路由
 	apiV1 := r.Group("/api/v1")
@@ -141,11 +182,13 @@ func main() {
 		documents := apiV1.Group("/documents")
 		documents.Use(middleware.AuthMiddleware(jwtManager, userService))
 		{
-			documents.GET("/accessible", handler.NewDocumentHandler(documentService, userService).ListAccessibleFiles)
-			documents.GET("/uploads", handler.NewDocumentHandler(documentService, userService).ListUploadedFiles)
-			documents.DELETE("/:fileMd5", handler.NewDocumentHandler(documentService, userService).DeleteDocument)
-			documents.GET("/download", handler.NewDocumentHandler(documentService, userService).GenerateDownloadURL) // Path param -> Query param
-			documents.GET("/preview", handler.NewDocumentHandler(documentService, userService).PreviewFile)
+			documentHandler := handler.NewDocumentHandler(documentService, userService)
+			documents.GET("/accessible", documentHandler.ListAccessibleFiles)
+			documents.GET("/uploads", documentHandler.ListUploadedFiles)
+			documents.DELETE("/:fileMd5", documentHandler.DeleteDocument)
+			documents.GET("/download", documentHandler.GenerateDownloadURL) // Path param -> Query param
+			documents.GET("/preview", documentHandler.PreviewFile)
+			documents.GET("/browser-preview", documentHandler.BrowserPreview) // 新增浏览器预览
 		}
 
 		// Search 路由组
@@ -166,8 +209,11 @@ func main() {
 		chatGroup := apiV1.Group("/chat")
 		{
 			chatGroup.GET("/websocket-token", handler.NewChatHandler(chatService, userService, jwtManager).GetWebsocketStopToken)
+			// 图增强版本获取 token (复用即可，或者根据需要区分)
+			chatGroup.GET("/graph/websocket-token", handler.NewChatHandler(graphChatService, userService, jwtManager).GetWebsocketStopToken)
 		}
 		r.GET("/chat/:token", handler.NewChatHandler(chatService, userService, jwtManager).Handle)
+		r.GET("/chat/graph/:token", handler.NewChatHandler(graphChatService, userService, jwtManager).Handle)
 
 		admin := apiV1.Group("/admin")
 		// 管理员路由组，需要同时通过认证和管理员授权两个中间件

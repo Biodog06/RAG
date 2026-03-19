@@ -29,6 +29,8 @@ type Client interface {
 	StreamChat(ctx context.Context, prompt string, writer MessageWriter) error
 	// Chat 执行非流式聊天调用。
 	Chat(ctx context.Context, messages []Message, gen *GenerationParams) (string, error)
+	// GenerateOneShot 执行非流式的一次性文本生成。
+	GenerateOneShot(ctx context.Context, messages []Message) (string, error)
 }
 
 type deepseekClient struct {
@@ -64,6 +66,14 @@ type chatResponse struct {
 		Delta struct {
 			Content string `json:"content"`
 		} `json:"delta"`
+	} `json:"choices"`
+}
+
+type nonStreamChatResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
 	} `json:"choices"`
 }
 
@@ -171,10 +181,26 @@ func (c *deepseekClient) Chat(ctx context.Context, messages []Message, gen *Gene
 		Messages: messages,
 		Stream:   false,
 	}
+
+	// 优先使用传入的生成参数
 	if gen != nil {
 		reqBody.Temperature = gen.Temperature
 		reqBody.TopP = gen.TopP
 		reqBody.MaxTokens = gen.MaxTokens
+	} else {
+		// 降级使用全局配置（若非零值）
+		if c.cfg.Generation.Temperature != 0 {
+			t := c.cfg.Generation.Temperature
+			reqBody.Temperature = &t
+		}
+		if c.cfg.Generation.TopP != 0 {
+			p := c.cfg.Generation.TopP
+			reqBody.TopP = &p
+		}
+		if c.cfg.Generation.MaxTokens != 0 {
+			m := c.cfg.Generation.MaxTokens
+			reqBody.MaxTokens = &m
+		}
 	}
 
 	reqBytes, err := json.Marshal(reqBody)
@@ -201,11 +227,7 @@ func (c *deepseekClient) Chat(ctx context.Context, messages []Message, gen *Gene
 		return "", fmt.Errorf("chat api returned non-200 status: %s, body: %s", resp.Status, string(bodyBytes))
 	}
 
-	var response struct {
-		Choices []struct {
-			Message Message `json:"message"`
-		} `json:"choices"`
-	}
+	var response nonStreamChatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		return "", fmt.Errorf("failed to decode chat response: %w", err)
 	}
@@ -214,4 +236,9 @@ func (c *deepseekClient) Chat(ctx context.Context, messages []Message, gen *Gene
 		return response.Choices[0].Message.Content, nil
 	}
 	return "", fmt.Errorf("empty response from chat api")
+}
+
+// GenerateOneShot 执行非流式的一次性文本生成。
+func (c *deepseekClient) GenerateOneShot(ctx context.Context, messages []Message) (string, error) {
+	return c.Chat(ctx, messages, nil)
 }

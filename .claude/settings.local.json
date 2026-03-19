@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find rag:*)",
+      "Bash(git checkout:*)",
+      "Bash(grep -r \"eino\" --include=\"*.go\" . 2>/dev/null | head -5)",
+      "Bash(git show:*)",
+      "Bash(git cherry-pick:*)",
+      "Bash(git reset:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "WebFetch(domain:mp.weixin.qq.com)"
+    ]
+  }
+}

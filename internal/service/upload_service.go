@@ -15,6 +15,7 @@ import (
 	"pai-smart-go/pkg/storage"
 	"pai-smart-go/pkg/tasks"
 	"strings"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"gorm.io/gorm"
@@ -259,7 +260,7 @@ func (s *uploadService) MergeChunks(ctx context.Context, fileMD5, fileName strin
 	log.Infof("[MergeChunks] 数据库文件状态已更新为“已完成”。文件ID: %d", record.ID)
 
 	// 4. 触发 Kafka 消息
-	objectURL, _ := storage.GetPresignedURL(s.minioCfg.BucketName, destObjectName, 60*60)
+	objectURL, _ := storage.GetPresignedURL(s.minioCfg.BucketName, destObjectName, time.Hour, nil)
 	task := tasks.FileProcessingTask{
 		FileMD5:   fileMD5,
 		ObjectUrl: objectURL,

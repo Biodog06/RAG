@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package mineru;
+
+option go_package = "pai-smart-go/pkg/mineru;mineru";
+
+// DocumentIntelligence 定义了文档解析与智能处理服务
+service DocumentIntelligence {
+    // ParseDocument 核心解析方法：支持 PDF, DOCX, PPTX 等多种格式
+    // 内部实现：针对非 PDF 格式（如 PPTX）会自动调用转换流水线转为 PDF 再由 MinerU 处理
+    rpc ParseDocument (ParseRequest) returns (ParseResponse);
+
+    // Heartbeat 服务心跳检测，确保 Python 解析服务存活且资源空闲
+    rpc Heartbeat (Empty) returns (StatusResponse);
+}
+
+message ParseRequest {
+    bytes file_content = 1;     // 文件二进制内容
+    string file_name = 2;       // 原始文件名（包含扩展名，用于逻辑路由）
+    bool force_ocr = 3;         // 是否强制开启 OCR
+    bool disable_layout = 4;    // 是否禁用布局分析（默认开启）
+}
+
+message ParseResponse {
+    string markdown = 1;        // 解析后的结构化内容 (Markdown 格式)
+    string layout_json = 2;     // 原始布局分析元数据 (JSON 格式，供高级功能使用)
+    string error_msg = 3;       // 错误信息（如果解析失败）
+    double process_time = 4;    // 解析耗时（秒）
+}
+
+message Empty {}
+
+message StatusResponse {
+    bool healthy = 1;           // 服务是否健康
+    string status = 2;          // 简短的状态描述
+    int32 concurrent_jobs = 3;  // 当前正在并发处理的任务数
+}

@@ -8,6 +8,7 @@ import (
 	"pai-smart-go/internal/config"
 	"pai-smart-go/internal/model"
 	"pai-smart-go/internal/repository"
+	"pai-smart-go/pkg/embedding"
 	"pai-smart-go/pkg/llm"
 	"pai-smart-go/pkg/log"
 	"strings"
@@ -25,33 +26,62 @@ type chatService struct {
 	searchService    SearchService
 	llmClient        llm.Client
 	conversationRepo repository.ConversationRepository
+	cacheService     ContentCacheService // 语义缓存服务
+	embeddingClient  embedding.Client    // 用于语义缓存的向量化
 }
 
 // NewChatService 创建一个新的 ChatService 实例。
-func NewChatService(searchService SearchService, llmClient llm.Client, conversationRepo repository.ConversationRepository) ChatService {
-	return &chatService{
+func NewChatService(searchService SearchService, llmClient llm.Client, conversationRepo repository.ConversationRepository, cacheService ContentCacheService, embeddingClient ...embedding.Client) ChatService {
+	cs := &chatService{
 		searchService:    searchService,
 		llmClient:        llmClient,
 		conversationRepo: conversationRepo,
+		cacheService:     cacheService,
 	}
+	if len(embeddingClient) > 0 {
+		cs.embeddingClient = embeddingClient[0]
+	}
+	return cs
 }
 
 // StreamResponse 协调 RAG 流程并流式传输 LLM 响应。
 func (s *chatService) StreamResponse(ctx context.Context, query string, user *model.User, ws *websocket.Conn, shouldStop func() bool) error {
-	// 1. 使用 SearchService 检索上下文（提升覆盖度：topK=10）
-	results, err := s.searchService.HybridSearch(ctx, query, 10, user)
-	if err != nil {
-		return fmt.Errorf("failed to retrieve context: %w", err)
+	// 0. 语义缓存查询：如果命中则直接返回缓存结果
+	var queryVector []float32
+	if s.cacheService != nil && s.embeddingClient != nil {
+		var embErr error
+		queryVector, embErr = s.embeddingClient.CreateEmbedding(ctx, query)
+		if embErr == nil && len(queryVector) > 0 {
+			if cachedResp, hit := s.cacheService.GetCachedResponse(ctx, queryVector); hit {
+				log.Infof("[ChatService] 语义缓存命中, 直接返回缓存响应")
+				// 将缓存的完整响应作为单个消息发送
+				payload := map[string]string{"chunk": cachedResp}
+				b, _ := json.Marshal(payload)
+				_ = ws.WriteMessage(websocket.TextMessage, b)
+				sendCompletion(ws)
+				return nil
+			}
+		} else if embErr != nil {
+			log.Warnf("[ChatService] 语义缓存向量化失败, 跳过缓存: %v", embErr)
+		}
 	}
 
-	// 2. 构建上下文与 system 消息、历史
-	contextText := s.buildContextText(results)
-	systemMsg := s.buildSystemMessage(contextText)
+	// 1. 加载对话历史（用于后续的查询重写与指代消解）
 	history, err := s.loadHistory(ctx, user.ID)
 	if err != nil {
 		log.Errorf("Failed to load conversation history: %v", err)
 		history = []model.ChatMessage{}
 	}
+
+	// 2. 使用 SearchService 检索上下文（传入 history 以支持高级重写）
+	results, err := s.searchService.HybridSearch(ctx, query, 10, user, history)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve context: %w", err)
+	}
+
+	// 3. 构建上下文与 system 消息
+	contextText := s.buildContextText(results)
+	systemMsg := s.buildSystemMessage(contextText)
 	messages := s.composeMessages(systemMsg, history, query)
 
 	// 拦截 websocket writer 以捕获完整答案，并包装为 JSON 分块
@@ -78,6 +108,16 @@ func (s *chatService) StreamResponse(ctx context.Context, query string, user *mo
 		if err != nil {
 			// 只记录错误，不返回给客户端，因为流式响应已经成功
 			log.Errorf("Failed to save conversation history: %v", err)
+		}
+
+		// 异步写入语义缓存
+		if s.cacheService != nil && len(queryVector) > 0 {
+			go func(vec []float32, resp string) {
+				cacheCtx := context.Background()
+				if err := s.cacheService.CacheResponse(cacheCtx, vec, resp); err != nil {
+					log.Warnf("[ChatService] 语义缓存写入失败: %v", err)
+				}
+			}(queryVector, fullAnswer)
 		}
 	}
 
