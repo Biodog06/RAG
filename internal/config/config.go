@@ -23,6 +23,7 @@ type Config struct {
 	Embedding     EmbeddingConfig     `mapstructure:"embedding"`
 	LLM           LLMConfig           `mapstructure:"llm"`
 	AI            AIConfig            `mapstructure:"ai"`
+	Search        SearchConfig        `mapstructure:"search"`
 }
 
 // ServerConfig 存储服务器相关的配置。
@@ -140,6 +141,12 @@ type AIPromptConfig struct {
 	RefStart     string `mapstructure:"ref-start"`
 	RefEnd       string `mapstructure:"ref-end"`
 	NoResultText string `mapstructure:"no-result-text"`
+}
+
+// SearchConfig 存储搜索相关的配置。
+type SearchConfig struct {
+	ConfidenceThreshold  float64 `mapstructure:"confidence_threshold"`
+	SpeculativeTimeoutMS int     `mapstructure:"speculative_timeout_ms"`
 }
 
 // Init 初始化配置加载，从指定的路径读取 YAML 文件并解析到 Conf 变量中。

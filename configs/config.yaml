@@ -68,3 +68,8 @@ llm:
     temperature: 0.3
     max_tokens: 2000
     top_p: 0.9
+    
+# 搜索优化配置
+search:
+  confidence_threshold: 0.95
+  speculative_timeout_ms: 200

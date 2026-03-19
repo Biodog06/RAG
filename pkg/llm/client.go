@@ -27,6 +27,8 @@ type Client interface {
 	StreamChatMessages(ctx context.Context, messages []Message, gen *GenerationParams, writer MessageWriter) error
 	// 为兼容旧调用，保留 StreamChat：由内部包装为 messages 调用。
 	StreamChat(ctx context.Context, prompt string, writer MessageWriter) error
+	// Chat 执行非流式聊天调用。
+	Chat(ctx context.Context, messages []Message, gen *GenerationParams) (string, error)
 }
 
 type deepseekClient struct {
@@ -160,4 +162,56 @@ func (c *deepseekClient) StreamChatMessages(ctx context.Context, messages []Mess
 		}
 	}
 	return nil
+}
+
+// Chat 执行非流式聊天调用。
+func (c *deepseekClient) Chat(ctx context.Context, messages []Message, gen *GenerationParams) (string, error) {
+	reqBody := chatRequest{
+		Model:    c.cfg.Model,
+		Messages: messages,
+		Stream:   false,
+	}
+	if gen != nil {
+		reqBody.Temperature = gen.Temperature
+		reqBody.TopP = gen.TopP
+		reqBody.MaxTokens = gen.MaxTokens
+	}
+
+	reqBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal chat request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.cfg.BaseURL+"/chat/completions", bytes.NewReader(reqBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create chat request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to call chat api: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("chat api returned non-200 status: %s, body: %s", resp.Status, string(bodyBytes))
+	}
+
+	var response struct {
+		Choices []struct {
+			Message Message `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return "", fmt.Errorf("failed to decode chat response: %w", err)
+	}
+
+	if len(response.Choices) > 0 {
+		return response.Choices[0].Message.Content, nil
+	}
+	return "", fmt.Errorf("empty response from chat api")
 }
