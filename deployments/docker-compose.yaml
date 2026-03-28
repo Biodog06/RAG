@@ -144,12 +144,31 @@ services:
       timeout: 10s
       retries: 3
 
+  neo4j:
+    image: neo4j:5.12-community
+    container_name: neo4j
+    restart: always
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/PaiSmart2025
+      - NEO4J_PLUGINS=["apoc"]
+    volumes:
+      - neo4j-data:/data
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "PaiSmart2025", "RETURN 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   mysql-data:
   redis-data:
   minio-data:
   kafka-data:
   es-data:
+  neo4j-data:
 
 networks:
   default:

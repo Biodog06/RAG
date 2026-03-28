@@ -1,7 +1,3 @@
----
-description: Pipeline Orchestrator - 协调 Issue-Manager, Repo-Flow-Manager 和 Code-Review 的全生命周期流程
----
-
 # 研发流水线联动指南 (Orchestrator)
 
 本指南说明了如何让三个智能体在 Claude 中高效联动，形成从“想法”到“高质量合并”的闭环。

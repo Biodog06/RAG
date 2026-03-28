@@ -1,7 +1,3 @@
----
-description: Repo Flow Manager - 自动化的 GitHub 任务处理流程（领取→方案→实现→测试→PR）
----
-
 # Repo Flow Manager 自动化流程规范
 
 本工作流用于指导 Claude 在 GitHub 仓库中执行全自动化的工程交付。
@@ -49,13 +45,12 @@ description: Repo Flow Manager - 自动化的 GitHub 任务处理流程（领取
   1. 使用正确的 Commit 信息格式提交代码：`feat(scope): desc` 或 `fix(scope): desc`。
   2. 推送分支到远程仓库。
   3. **创建 PR**:
-     - **操作**: 参考 `CLAUDE.md` 中的 **Pull Request Standards**。
-     - **命令**: `gh pr create --title "feat/fix: <title>" --body "Closes #<ISSUE_NUMBER>\n\n<PR_DETAILS>"`。
+     - **操作**: 调用 .claude\skills\pull-request 中的skill 创建 PR。
   4. 设置 PR 状态（如需要）。
 
 ### 5. 质量审查与 CI 验证 (CI Gates)
 - **目标**: 确保交付质量。
-- **操作**: PR 创建成功后，自动启动 CI 流程（包含单元测试跑测）。Agent 需关注 CI 状态，或启动 `Code Review Agent` 配合 CI 反馈进行深度检查。
+- **操作**: PR 创建成功后，自动启动 CI 流程（包含单元测试跑测）。Agent 需关注 CI 状态，启动 `Code Review Agent` 配合 CI 反馈进行深度检查。
 
 ## Agent 职责与触发时机
 
