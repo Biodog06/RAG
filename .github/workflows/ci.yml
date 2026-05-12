@@ -1,0 +1,69 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  backend-test:
+    name: Backend Tests (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22' # 根据项目实际版本调整
+
+      - name: Install dependencies
+        run: go mod tidy
+
+      - name: Run Backend Tests
+        run: go test -v -coverprofile=coverage.out ./...
+
+  frontend-test:
+    name: Frontend Tests (Vue 3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: pnpm install
+
+      - name: Lint & Typecheck
+        working-directory: ./frontend
+        run: |
+          pnpm run lint
+          pnpm run typecheck
+
+      - name: Build
+        working-directory: ./frontend
+        run: pnpm run build
+
+  code-review:
+    name: Automated Code Review
+    needs: [backend-test, frontend-test]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Trigger Custom Code Review Agent
+        run: |
+          echo "Triggering Code Review Agent for PR #${{ github.event.pull_request.number }}"
+          # 这里通常调用一个封装好的脚本或通知 Antigravity 系统进行审查
+          # 示例：curl -X POST ...

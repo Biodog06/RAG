@@ -1,0 +1,32 @@
+# Binaries
+*.exe
+*.exe~
+bin/
+server
+eval
+tools
+tmp_*.exe
+
+# Reports and logs
+/logs
+eval_report*.json
+ragas_samples*.json
+test_cases_*.json
+build_err.txt
+temp_issue_body.md
+test_resp.json
+
+# IDEs and local settings
+/.qoder
+/.idea
+/.vscode
+.claude/settings.local.json
+
+# Data and Temp files
+RAG.zip
+/initfile/
+/vendor/
+/configs
+/frontend/packages/scripts/bin.ts
+test_docs_crypto/
+*.backup.json
